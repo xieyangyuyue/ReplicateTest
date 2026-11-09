@@ -1,0 +1,5 @@
+# 依赖库清单（pip 安装：pip3 install -r requirements.txt）
+matplotlib==2.0.2   # 绘图库：数据与结果可视化
+numpy==1.13.3       # 数值计算库：数组操作
+scipy==0.19.1       # 科学计算库：此处用 scipy.misc 读写图像（新版已移除该接口）
+torchvision==0.1.9  # 计算机视觉库：提供 VGG 预训练模型与 make_grid 等工具
