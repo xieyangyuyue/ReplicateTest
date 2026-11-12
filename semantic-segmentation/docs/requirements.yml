@@ -1,0 +1,12 @@
+# Conda 环境依赖清单（conda env create -f requirements.yml）
+name: seg_requirements  # conda 环境名称
+dependencies:            # 依赖列表
+- python3                # Python 3 解释器
+- numpy                  # 数值计算库
+- cuda                   # NVIDIA CUDA 工具链（GPU 计算支持）
+- pip:                   # 以下依赖通过 pip 安装
+  - Image                # 图像处理（应为 Pillow 的旧名，pip 包名写法存疑）
+  - tqdm                 # 进度条显示
+  - requests             # HTTP 库：下载权重/数据集
+  - pytorch 1.0          # PyTorch 框架（pip 通道的版本写法存疑，官方为 torch）
+  - torchvision          # 计算机视觉库
