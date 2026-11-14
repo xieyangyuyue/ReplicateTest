@@ -57,7 +57,7 @@ class FCN(SegBaseModel):  # FCN(v2) 模型：继承 SegBaseModel，复用 ResNet
 class _FCNHead(nn.Module):  # FCN 分割头：3x3 卷积降维 + BN + ReLU + Dropout + 1x1 投影到类别数
     # ----------------------- __init__ 参数说明 -----------------------
     # in_channels：输入通道数（主头 2048 / 辅助头 1024）
-    # channels：输出通道数（= nclass）
+    # channels：输出通道数（= nclass）get_fcn_resnet50_voc
     # norm_layer：归一化层类型，默认 nn.BatchNorm2d
     # norm_kwargs：传给归一化层的额外参数字典（如 SyncBN 的参数），None 表示无
     # **kwargs：兼容上层透传的其他参数（此处不使用）

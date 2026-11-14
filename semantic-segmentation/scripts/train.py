@@ -4,8 +4,8 @@
 #               vgg/resnet/densenet 等 backbone 的组合，覆盖 pascal_voc、
 #               pascal_aug、ade20k、citys、sbu 五个数据集；包含 warmup+poly
 #               学习率调度、OHEM 与辅助损失、AMP 混合精度、SyncBN/DDP 分布式训练、
-#               tqdm 进度条（每 epoch 只刷新一次，适合 Kaggle/Notebook）、
-#               checkpoint 保存与日志管理。
+#               tqdm 实时进度条（训练每个 iteration 刷新 loss/lr/epoch，验证实时刷新
+#               pixAcc/mIoU）、checkpoint 保存与日志管理。
 # 【运行方式】单卡：python train.py --model fcn --backbone resnet50 --dataset pascal_voc --amp
 #               多卡：torchrun --nproc_per_node=N train.py ... --amp
 #               或旧版：python -m torch.distributed.launch --nproc_per_node=N train.py ... --amp
@@ -39,8 +39,10 @@ import torch.backends.cudnn as cudnn  # cuDNN 后端接口：开启 benchmark �
 
 try:  # 进度条库：优先使用 tqdm；环境未安装时降级为静默进度条，保证脚本仍可运行
     from tqdm import tqdm  # tqdm 进度条类
+    from tqdm.contrib.logging import logging_redirect_tqdm  # 把控制台日志转交 tqdm.write，避免日志与进度条互相覆盖
 except ImportError:  # 未安装 tqdm
     tqdm = None  # 置为 None，后续按需走静默分支
+    logging_redirect_tqdm = None  # 无 tqdm 时也没有日志重定向上下文
 
 from torchvision import transforms  # 图像变换库：构建 ToTensor + Normalize 输入预处理流水线
 from core.data.dataloader import get_segmentation_dataset  # 数据集工厂函数：按名称创建训练/验证 Dataset
@@ -84,6 +86,20 @@ def make_progress_bar(*args, **kwargs):  # 创建进度条的工厂函数：自�
     return tqdm(*args, **kwargs)  # 正常创建 tqdm 进度条
 
 
+class _NullContext(object):  # 空上下文：tqdm 缺失或非主进程时替代 logging_redirect_tqdm
+    def __enter__(self):  # 进入 with 语句
+        return self  # 返回自身
+
+    def __exit__(self, *args):  # 退出 with 语句
+        return False  # 不吞异常
+
+
+def redirect_logging_to_tqdm(enabled):  # 主进程且安装 tqdm 时，把控制台日志交给 tqdm.write
+    if enabled and logging_redirect_tqdm is not None:  # 需要重定向且 tqdm 可用
+        return logging_redirect_tqdm(loggers=[logger])  # 仅替换控制台 handler，文件日志保持不变
+    return _NullContext()  # 否则使用空上下文
+
+
 def make_grad_scaler(enabled):  # 创建 AMP 梯度缩放器，兼容不同 PyTorch 版本的 API
     if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):  # PyTorch 2.x 新接口
         try:
@@ -110,7 +126,7 @@ def parse_args():  # 定义命令行参数解析函数（eval.py 也会 import �
                             'deeplabv3_plus', 'danet', 'denseaspp', 'bisenet', 'encnet',  # 可选项：DeepLabV3+、DANet、DenseASPP、BiSENet、EncNet
                             'dunet', 'icnet', 'enet', 'ocnet', 'psanet', 'cgnet', 'espnet',  # 可选项：DUNet、ICNet、ENet、OCNet、PSANet、CGNet、ESPNet
                             'lednet', 'dfanet','swnet'],  # 可选项：LEDNet、DFANet、SWNet
-                        help='model name (default: fcn32s)')  # 【注意】help 写的默认值 fcn32s 与实际 default='fcn' 不一致
+                        help='model name (default: fcns)')  
     parser.add_argument('--backbone', type=str, default='resnet50',  # backbone（骨干特征提取网络）名称，默认 'resnet50'
                         choices=['vgg16', 'resnet18', 'resnet50', 'resnet101', 'resnet152',  # 可选项：VGG16 与 ResNet 系列
                             'densenet121', 'densenet161', 'densenet169', 'densenet201'],  # 可选项：DenseNet 系列
@@ -163,14 +179,14 @@ def parse_args():  # 定义命令行参数解析函数（eval.py 也会 import �
     # checkpoint and log
     parser.add_argument('--resume', type=str, default=None,  # 断点续训权重文件路径，默认不恢复
                         help='put the path to resuming file if needed')  # 帮助文本：续训文件路径
-    parser.add_argument('--save-dir', default='~/.torch/models',  # checkpoint 保存目录（支持 ~ 展开），默认 ~/.torch/models
+    parser.add_argument('--save-dir', default='~/.torch/trainmodels',  # checkpoint 保存目录（支持 ~ 展开），默认 ~/.torch/trainmodels
                         help='Directory for saving checkpoint models')  # 帮助文本：模型保存目录
     parser.add_argument('--save-epoch', type=int, default=10,  # 每隔多少 epoch 保存一次 checkpoint，默认 10
                         help='save model every checkpoint-epoch')  # 帮助文本：保存间隔
     parser.add_argument('--log-dir', default='../runs/logs/',  # 日志文件保存目录，默认 ../runs/logs/
                         help='Directory for saving checkpoint models')  # 【注意】help 文本复制自 --save-dir，该目录实际保存的是日志而非模型
-    parser.add_argument('--log-iter', type=int, default=0,  # 训练日志间隔；0 表示每个 epoch 只打印一次（Kaggle 推荐）
-                        help='print log every N iterations; 0 = once per epoch (default)')  # 帮助文本：0 为按轮打印，>0 为按迭代打印
+    parser.add_argument('--log-iter', type=int, default=0,  # 训练日志间隔；0 表示每个 epoch 结束时只打印一行汇总（进度条仍每 iteration 刷新）
+                        help='print log every N iterations; 0 = once per epoch (default)')  # 帮助文本：0 为按轮打印，>0 为额外按迭代打印
     # evaluation only
     parser.add_argument('--val-epoch', type=int, default=1,  # 每隔多少 epoch 验证一次，默认 1（每轮都验证）
                         help='run validation every val-epoch')  # 帮助文本：验证间隔
@@ -294,86 +310,85 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
     def train(self):  # 训练主循环：按迭代（iteration）而非 epoch 驱动
         save_to_disk = get_rank() == 0  # 仅 0 号进程写日志/保存 checkpoint，避免多进程重复写文件
         epochs, max_iters = self.args.epochs, self.args.max_iters  # 取出总轮数与总迭代数
-        # 日志默认每个 epoch 打印一次（--log-iter 0）；显式设置为 >0 时才按迭代间隔打印。
-        # Kaggle/Notebook 不适合频繁刷新输出，因此默认不再每 10 个 iteration 打印一行。
-        log_per_iters = max(1, self.args.log_iter) if self.args.log_iter > 0 else max(1, self.args.iters_per_epoch)
+        # --log-iter 0（默认）：只在每个 epoch 结束时打印一行汇总；
+        # --log-iter N>0：每 N 个 iteration 额外打印一行。进度条本身每个 iteration 都会刷新。
+        log_per_iters = max(1, self.args.log_iter)
         val_per_iters = max(1, self.args.val_epoch * self.args.iters_per_epoch)  # 验证间隔（epoch 数换算为迭代数）
         save_per_iters = max(1, self.args.save_epoch * self.args.iters_per_epoch)  # checkpoint 保存间隔（epoch 数换算为迭代数）
         start_time = time.time()  # 记录训练开始时刻，用于统计耗时
         logger.info('Start training, Total Epochs: {:d} = Total Iterations {:d}'.format(epochs, max_iters))  # 打印训练总规模（轮数与总迭代数）
-        logger.info('AMP: {} | Best checkpoint metric: {}'.format(self.amp, self.args.best_metric))  # 记录 AMP 与模型选优标准
 
-        # tqdm 进度条：按 epoch 计数，每个 epoch 只刷新一次。
-        # Kaggle/Notebook 环境不适合反复刷新：固定宽度 + ASCII + 仅在 epoch 结束时 update()。
-        # mininterval=0、miniters=1 表示每次 update 都显示；而下方每轮只调用一次 update(1)。
-        progress = make_progress_bar(total=epochs, desc='Epoch 1/{:d}'.format(epochs), unit='epoch',  # 总进度条以 epoch 为单位
-                                     mininterval=0, miniters=1,  # 关闭时间节流，每次 update（每轮一次）刷新
-                                     dynamic_ncols=False, ncols=100, ascii=True,  # 固定宽度/ASCII：Kaggle 输出更稳定
-                                     file=sys.stdout, leave=True,  # 显式写 stdout，结束后保留最后一行
+        # 训练总进度条：total 为整个训练的总迭代数，每个 iteration 都 update(1)。
+        # tqdm 会基于实测速度自动显示 elapsed / remaining / it/s；epoch、loss、lr 放在 postfix 中动态刷新。
+        progress = make_progress_bar(total=max_iters, desc='Train', unit='it',  # 以“迭代”为单位的总进度条
+                                     dynamic_ncols=True,  # 随终端宽度自适应，避免窄终端换行错乱
+                                     mininterval=0.1, miniters=1,  # 最多 10 次/秒刷新，兼顾流畅与开销
+                                     file=sys.stdout, leave=True,  # 输出到 stdout，结束后保留进度条
+                                     position=0,  # 固定在终端底部第 0 行（验证进度条使用第 1 行）
                                      disable=not save_to_disk)  # 非主进程不显示进度条
-        last_epoch = 0  # 上一次已刷新的 epoch（0 表示尚未开始）
-        epoch_loss = 0.0  # 当前 epoch 的累计损失（仅用于每轮一次的进度条显示）
+        epoch_loss = 0.0  # 当前 epoch 的累计损失
         epoch_iters = 0  # 当前 epoch 已完成的迭代数
+        current_epoch = 0  # 当前 epoch 编号（0 表示尚未开始）
 
         self.model.train()  # 切换训练模式：BN 使用批统计量，Dropout 生效
-        for iteration, (images, targets, _) in enumerate(self.train_loader):  # 遍历训练数据；第三个返回值（文件名列表）以下划线丢弃
-            iteration = iteration + 1  # 迭代号从 1 开始计数，便于取模判断打印/保存/验证时机
-            current_epoch = min(epochs, (iteration - 1) // self.args.iters_per_epoch + 1)  # 由迭代号换算当前 epoch
-            if last_epoch and current_epoch != last_epoch:  # 上一轮已结束（本迭代属于新一轮）
-                # 每个 epoch 只在这里刷新一次 tqdm：显示上一轮的平均 loss 与学习率
-                progress.set_description('Epoch {:d}/{:d}'.format(last_epoch, epochs), refresh=False)  # 先改描述但不刷新
-                progress.set_postfix(loss='{:.4f}'.format(epoch_loss / max(1, epoch_iters)),  # 上一轮平均损失
+        # 主进程把控制台日志交给 tqdm.write：日志行会打印在进度条上方，不会把进度条挤乱
+        with redirect_logging_to_tqdm(save_to_disk):
+            for iteration, (images, targets, _) in enumerate(self.train_loader):  # 遍历训练数据；第三个返回值（文件名列表）以下划线丢弃
+                iteration = iteration + 1  # 迭代号从 1 开始计数，便于取模判断打印/保存/验证时机
+                epoch = min(epochs, (iteration - 1) // self.args.iters_per_epoch + 1)  # 由迭代号换算当前 epoch
+                if current_epoch and epoch != current_epoch:  # 刚跨过 epoch 边界：先输出上一轮汇总
+                    if save_to_disk:  # 仅主进程打印
+                        logger.info('Epoch {:d}/{:d} done | train loss {:.4f} | lr {:.2e}'.format(  # 上一轮平均损失与学习率
+                            current_epoch, epochs, epoch_loss / max(1, epoch_iters),
+                            self.optimizer.param_groups[0]['lr']))
+                    epoch_loss, epoch_iters = 0.0, 0  # 重置新一轮统计
+                current_epoch = epoch  # 记录当前 epoch
+
+                images = images.to(self.device, non_blocking=True)  # 图像批次搬运到计算设备
+                targets = targets.to(self.device, non_blocking=True)  # 标签批次搬运到计算设备
+
+                with autocast_context(self.device.type, self.amp):  # AMP 上下文：启用时前向/损失自动使用 FP16，未启用时为空操作
+                    outputs = self.model(images)  # 前向传播：返回输出列表，outputs[0] 为主预测，开启 aux 时含 outputs[1] 辅助输出
+                    loss_dict = self.criterion(outputs, targets)  # 计算损失，返回形如 {'loss': …, 'aux_loss': …} 的字典
+                    losses = sum(loss for loss in loss_dict.values())  # 汇总各损失项得到总损失（用于反向传播）
+
+                # reduce losses over all GPUs for logging purposes
+                loss_dict_reduced = reduce_loss_dict(loss_dict)  # 分布式下跨 GPU 归约（求平均）各项损失，仅用于日志显示
+                losses_reduced = sum(loss for loss in loss_dict_reduced.values())  # 汇总归约后的总损失（仅日志显示用，不参与反传）
+                epoch_loss += losses_reduced.item()  # 累计本 epoch 损失
+                epoch_iters += 1  # 本 epoch 已完成迭代数 +1
+
+                self.optimizer.zero_grad()  # 清空上一迭代残留的梯度
+                self.scaler.scale(losses).backward()  # AMP：缩放损失后反向传播（未启用 AMP 时等价于 losses.backward()）
+                self.scaler.step(self.optimizer)  # AMP：先反缩放梯度再更新参数（未启用时等价于 optimizer.step()）
+                self.scaler.update()  # AMP：根据是否出现 inf/nan 动态调整缩放因子（未启用时为空操作）
+                self.lr_scheduler.step()  # 先 optimizer.step() 再 scheduler.step()，符合 PyTorch 推荐顺序，避免 "step before optimizer.step" 警告
+
+                # 先更新 postfix 再 update(1)：一次刷新同时反映新的进度与指标
+                progress.set_postfix(epoch='{}/{}'.format(epoch, epochs),  # 当前轮次
+                                     loss='{:.4f}'.format(epoch_loss / max(1, epoch_iters)),  # 本轮平均损失
                                      lr='{:.2e}'.format(self.optimizer.param_groups[0]['lr']),  # 当前学习率
-                                     refresh=False)  # 禁止 set_postfix 自行刷新
-                progress.update(1)  # 唯一的刷新点：进度前进 1 个 epoch
-                epoch_loss, epoch_iters = 0.0, 0  # 重置下一轮统计
-                progress.set_description('Epoch {:d}/{:d}'.format(current_epoch, epochs), refresh=False)  # 准备新一轮描述
-            last_epoch = current_epoch  # 记录当前 epoch
-            self.lr_scheduler.step()  # 每个迭代更新一次学习率（warmup + poly 按迭代步进）；【注意】首轮先于 optimizer.step() 调用，新版 PyTorch 可能触发调用顺序警告
+                                     refresh=False)  # 禁止 set_postfix 自行刷新，统一由 update 触发
+                progress.update(1)  # 每个 iteration 前进一格并刷新
 
-            images = images.to(self.device, non_blocking=True)  # 图像批次搬运到计算设备
-            targets = targets.to(self.device, non_blocking=True)  # 标签批次搬运到计算设备
+                if self.args.log_iter > 0 and iteration % log_per_iters == 0 and save_to_disk:  # 可选：按迭代打印日志
+                    logger.info('Iter {:d}/{:d} | epoch {:d}/{:d} | lr {:.2e} | loss {:.4f}'.format(  # 当前迭代的详细信息
+                        iteration, max_iters, epoch, epochs,
+                        self.optimizer.param_groups[0]['lr'], losses_reduced.item()))
 
-            with autocast_context(self.device.type, self.amp):  # AMP 上下文：启用时前向/损失自动使用 FP16，未启用时为空操作
-                outputs = self.model(images)  # 前向传播：返回输出列表，outputs[0] 为主预测，开启 aux 时含 outputs[1] 辅助输出
-                loss_dict = self.criterion(outputs, targets)  # 计算损失，返回形如 {'loss': …, 'aux_loss': …} 的字典
-                losses = sum(loss for loss in loss_dict.values())  # 汇总各损失项得到总损失（用于反向传播）
+                if iteration % save_per_iters == 0 and save_to_disk:  # 到达保存间隔且为主进程时保存 checkpoint
+                    save_checkpoint(self.model, self.args, is_best=False)  # 常规保存（不标记为最优）
 
-            # reduce losses over all GPUs for logging purposes
-            loss_dict_reduced = reduce_loss_dict(loss_dict)  # 分布式下跨 GPU 归约（求平均）各项损失，仅用于日志显示
-            losses_reduced = sum(loss for loss in loss_dict_reduced.values())  # 汇总归约后的总损失（仅日志显示用，不参与反传）
-            epoch_loss += losses_reduced.item()  # 累计本 epoch 损失（供每轮一次的进度条/日志显示）
-            epoch_iters += 1  # 本 epoch 已完成迭代数 +1
+                if not self.args.skip_val and iteration % val_per_iters == 0:  # 未跳过验证且到达验证间隔时执行验证
+                    self.validation(epoch)  # 在验证集上评估全部指标，若选优指标创新高则保存 best_model
+                    self.model.train()  # 验证用的 eval 模式会改变 BN/Dropout 行为，验证后须切回训练模式
 
-            self.optimizer.zero_grad()  # 清空上一迭代残留的梯度
-            self.scaler.scale(losses).backward()  # AMP：缩放损失后反向传播（未启用 AMP 时等价于 losses.backward()）
-            self.scaler.step(self.optimizer)  # AMP：先反缩放梯度再更新参数（未启用时等价于 optimizer.step()）
-            self.scaler.update()  # AMP：根据是否出现 inf/nan 动态调整缩放因子（未启用时为空操作）
+            if epoch_iters > 0 and save_to_disk:  # 最后一个 epoch 的汇总（循环内只在跨轮时打印上一轮）
+                logger.info('Epoch {:d}/{:d} done | train loss {:.4f} | lr {:.2e}'.format(
+                    current_epoch, epochs, epoch_loss / max(1, epoch_iters),
+                    self.optimizer.param_groups[0]['lr']))
+            progress.close()  # 关闭训练总进度条
 
-            eta_seconds = ((time.time() - start_time) / iteration) * (max_iters - iteration)  # 按当前平均迭代耗时估算剩余训练秒数
-            eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))  # 格式化为 "时:分:秒" 形式的 ETA 字符串
-
-            if iteration % log_per_iters == 0 and save_to_disk:  # 到达日志间隔且为主进程时打印训练日志
-                log_loss = epoch_loss / max(1, epoch_iters) if self.args.log_iter == 0 else losses_reduced.item()  # 按轮打印时用本轮平均损失
-                logger.info(  # 记录迭代进度/当前学习率/归约后损失/已用时间/预计剩余时间
-                    "Iters: {:d}/{:d} || Lr: {:.6f} || Loss: {:.4f} || Cost Time: {} || Estimated Time: {}".format(  # 训练日志格式串：迭代进度/学习率/损失/已用时间/预计剩余时间
-                        iteration, max_iters, self.optimizer.param_groups[0]['lr'], log_loss,  # 打印第 0 个参数组（backbone）的学习率与损失
-                        str(datetime.timedelta(seconds=int(time.time() - start_time))), eta_string))  # 已用时间字符串与预计剩余时间
-
-            if iteration % save_per_iters == 0 and save_to_disk:  # 到达保存间隔且为主进程时保存 checkpoint
-                save_checkpoint(self.model, self.args, is_best=False)  # 常规保存（不标记为最优）
-
-            if not self.args.skip_val and iteration % val_per_iters == 0:  # 未跳过验证且到达验证间隔时执行验证
-                self.validation()  # 在验证集上评估全部指标，若选优指标创新高则保存 best_model
-                self.model.train()  # 验证用的 eval 模式会改变 BN/Dropout 行为，验证后须切回训练模式
-
-        if epoch_iters > 0:  # 最后一个 epoch 尚未刷新（循环内只在进入新一轮时刷新上一轮）
-            progress.set_description('Epoch {:d}/{:d}'.format(last_epoch, epochs), refresh=False)  # 最后一轮描述
-            progress.set_postfix(loss='{:.4f}'.format(epoch_loss / max(1, epoch_iters)),  # 最后一轮平均损失
-                                 lr='{:.2e}'.format(self.optimizer.param_groups[0]['lr']),  # 最终学习率
-                                 refresh=False)  # 禁止自行刷新
-            progress.update(1)  # 刷新一次并补满总进度
-        progress.close()  # 关闭总进度条
         if save_to_disk:  # 仅主进程写最终权重
             save_checkpoint(self.model, self.args, is_best=False)  # 训练循环结束后再保存一次最终权重
         total_training_time = time.time() - start_time  # 统计训练总耗时（秒）
@@ -382,7 +397,7 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
             "Total training time: {} ({:.4f}s / it)".format(  # 训练总耗时与平均单次迭代耗时的格式串
                 total_training_str, total_training_time / max(1, max_iters)))  # 平均耗时 = 总耗时 / 总迭代数
 
-    def validation(self):  # 验证函数：在验证集上累积计算 pixAcc/mIoU/mPA/FWIoU 等指标
+    def validation(self, epoch=None):  # 验证函数：在验证集上累积计算 pixAcc/mIoU/mPA/FWIoU 等指标
         save_to_disk = get_rank() == 0  # 仅主进程打印日志/保存模型
         is_best = False  # 是否为最优模型的标记，默认 False
         self.metric.reset()  # 清空指标内部累积的统计量
@@ -394,17 +409,20 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
             torch.cuda.empty_cache()  # 释放未使用的缓存显存
         model.eval()  # 切换评估模式：BN 使用运行统计量，Dropout 关闭
 
+        desc = 'Val' if epoch is None else 'Val {}/{}'.format(epoch, self.args.epochs)  # 进度条描述：带轮次信息
         if tqdm is not None and save_to_disk:  # 主进程显示验证进度条
-            # 验证进度条只在整轮验证结束时刷新一次（miniters=总批数），避免 Kaggle 输出刷屏
-            val_iter = tqdm(self.val_loader, desc='Validation', unit='batch',  # 包装验证 loader
-                            mininterval=0, miniters=max(1, len(self.val_loader)),  # 关闭时间节流，仅最后一批刷新
-                            dynamic_ncols=False, ncols=100, ascii=True,  # 固定宽度/ASCII，Kaggle 更稳定
-                            file=sys.stdout, leave=False)  # 显式写 stdout，验证结束后不保留
+            # 手工更新进度条（不用 tqdm(loader) 包装），这样进度条计数与当前 batch 指标同步；
+            # position=1 让验证条显示在训练总进度条下方，互不覆盖。
+            val_bar = tqdm(total=len(self.val_loader), desc=desc, unit='batch',  # 总批次数即验证集批数
+                           dynamic_ncols=True,  # 随终端宽度自适应
+                           mininterval=0.1, miniters=1,  # 最多 10 次/秒刷新
+                           file=sys.stdout, leave=False,  # 与训练条同一输出流；结束后清除验证条
+                           position=1)  # 固定在训练进度条下方
         else:  # 非主进程或未安装 tqdm
-            val_iter = self.val_loader  # 直接遍历
+            val_bar = None  # 不使用进度条
 
-        log_every = max(1, len(self.val_loader) // 10)  # 验证日志最多约 10 行，避免刷屏
-        for i, (image, target, filename) in enumerate(val_iter):  # 逐批遍历验证集（filename 为文件名列表，此处未使用）
+        log_every = max(1, len(self.val_loader) // 10)  # 无 tqdm 时按 10% 间隔打印日志
+        for i, (image, target, filename) in enumerate(self.val_loader):  # 逐批遍历验证集（filename 为文件名列表，此处未使用）
             image = image.to(self.device, non_blocking=True)  # 图像搬运到计算设备
             target = target.to(self.device, non_blocking=True)  # 标签搬运到计算设备
 
@@ -413,13 +431,17 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
                     outputs = model(image)  # 前向推理得到输出列表
             self.metric.update(outputs[0], target)  # 用主输出（outputs[0]）与标签更新累计统计量
             pixAcc, mIoU = self.metric.get()  # 获取到目前为止累积的像素精度与平均 IoU
-            if save_to_disk:  # 仅主进程更新显示
-                if (i + 1) % log_every == 0 or (i + 1) == len(self.val_loader):  # 每 10% 或最后一个 batch 记录日志
-                    logger.info("Validation batch: {:d}/{:d}, pixAcc: {:.3f}, mIoU: {:.3f}".format(  # 验证中间日志
-                        i + 1, len(self.val_loader), pixAcc, mIoU))  # 当前累计指标（0~1 小数，非百分比）
+            if val_bar is not None:  # 主进程：把累计指标动态显示在验证进度条右侧
+                val_bar.set_postfix(pixAcc='{:.3f}'.format(pixAcc),  # 当前累计像素精度
+                                    mIoU='{:.3f}'.format(mIoU),  # 当前累计平均 IoU
+                                    refresh=False)  # 交由 update 统一刷新，避免重复渲染
+                val_bar.update(1)  # 进度 +1 并刷新当前 batch 的指标
+            elif save_to_disk and ((i + 1) % log_every == 0 or (i + 1) == len(self.val_loader)):  # 无 tqdm 时的兜底日志
+                logger.info("Validation batch: {:d}/{:d}, pixAcc: {:.3f}, mIoU: {:.3f}".format(  # 验证中间日志
+                    i + 1, len(self.val_loader), pixAcc, mIoU))  # 当前累计指标（0~1 小数，非百分比）
 
-        if tqdm is not None and save_to_disk:  # 关闭验证进度条
-            val_iter.close()  # 释放进度条显示
+        if val_bar is not None:  # 关闭验证进度条
+            val_bar.close()  # 释放进度条显示
 
         self.metric.all_reduce()  # 多卡验证：把各 rank 的统计量求和，得到全局指标
         scores = self.metric.get_scores()  # 一次性取出全部指标

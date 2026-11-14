@@ -18,19 +18,33 @@ from ..utils.download import download, check_sha1  # 自研下载工具：downlo
 __all__ = ['get_model_file', 'get_resnet_file']  # 模块公开接口：两个权重文件定位函数
 
 _model_sha1 = {name: checksum for checksum, name in [  # 字典推导式：把 (SHA1, 模型名) 列表反转为 {模型名: 完整 SHA1} 映射
-    ('25c4b50959ef024fcc050213a06b614899f94b3d', 'resnet50'),  # ResNet50 骨干权重的 SHA1 校验值
-    ('2a57e44de9c853fa015b172309a1ee7e2d0e4e2a', 'resnet101'),  # ResNet101 骨干权重的 SHA1 校验值
-    ('0d43d698c66aceaa2bc0309f55efdd7ff4b143af', 'resnet152'),  # ResNet152 骨干权重的 SHA1 校验值
+    # 【已更新】官方旧仓库 hangzh.s3.amazonaws.com 已失效（403），改用 PyTorch-Encoding
+    # 当前使用的 wasabisys 仓库；权重名也由旧的 resnet50/101/152 改为
+    # resnet50s/101s/152s（"s" 即 deep_stem 版本，与本文件的 resnet*_v1s 结构一致）。
+    ('a75c83cfc89a56a4e8ba71b14f1ec67e923787b3', 'resnet50s'),  # ResNet50s（deep_stem）骨干权重的 SHA1 校验值
+    ('03a0f310d6447880f1b22a83bd7d1aa7fc702c6e', 'resnet101s'),  # ResNet101s（deep_stem）骨干权重的 SHA1 校验值
+    ('36670e8bc2428ecd5b7db1578538e2dd23872813', 'resnet152s'),  # ResNet152s（deep_stem）骨干权重的 SHA1 校验值
 ]}  # (SHA1, 模型名) 列表与外层字典推导结束，得到 {模型名: SHA1} 完整校验表
 
-encoding_repo_url = 'https://hangzh.s3.amazonaws.com/'  # encoding 官方权重仓库（S3）默认地址，可用环境变量 ENCODING_REPO 覆盖
-_url_format = '{repo_url}encoding/models/{file_name}.zip'  # 下载 URL 模板：仓库地址 + encoding/models/ + 文件名.zip
+# 本工程对外仍沿用 resnet50/101/152 的旧名称，这里映射到新版仓库中的实际权重名
+_model_alias = {'resnet50': 'resnet50s', 'resnet101': 'resnet101s', 'resnet152': 'resnet152s'}  # 旧名称 → 新权重名
+# 旧版仓库/旧缓存的文件名与 SHA1（结构与 v1s 完全一致）；若本地已有旧权重则直接复用，避免重新下载
+_legacy_model_sha1 = {name: checksum for checksum, name in [  # {旧模型名: 旧 SHA1}
+    ('25c4b50959ef024fcc050213a06b614899f94b3d', 'resnet50'),
+    ('2a57e44de9c853fa015b172309a1ee7e2d0e4e2a', 'resnet101'),
+    ('0d43d698c66aceaa2bc0309f55efdd7ff4b143af', 'resnet152'),
+]}
+_legacy_alias = {v: k for k, v in _model_alias.items()}  # 新权重名 → 旧缓存名（resnet50s → resnet50）
+
+encoding_repo_url = 'https://s3.us-west-1.wasabisys.com/encoding'  # encoding 官方权重仓库新地址，可用环境变量 ENCODING_REPO 覆盖
+_url_format = '{repo_url}models/{file_name}.zip'  # 下载 URL 模板：仓库地址 + models/ + 文件名.zip（仓库地址末尾会自动补斜杠）
 
 
 # ----------------------- short_hash 参数说明 -----------------------
 # name：模型名称（如 'resnet50'），必须已登记在 _model_sha1 中
 # 返回：该模型 SHA1 的前 8 位短哈希（用于构成缓存文件名）
 def short_hash(name):  # 取模型权重 SHA1 的前 8 位短哈希
+    name = _model_alias.get(name, name)  # 兼容旧接口名：resnet50 → resnet50s
     if name not in _model_sha1:  # 名称不在登记表中
         raise ValueError('Pretrained model for {name} is not available.'.format(name=name))  # 抛值错误：该模型无预训练权重记录
     return _model_sha1[name][:8]  # 截取 SHA1 字符串前 8 个字符
@@ -41,7 +55,8 @@ def short_hash(name):  # 取模型权重 SHA1 的前 8 位短哈希
 # root：权重缓存根目录，默认 '~/.torch/models'
 # 返回：本地 .pth 权重文件的完整路径（必要时先下载解压）
 def get_resnet_file(name, root='~/.torch/models'):  # 获取 ResNet 骨干权重路径：查缓存 → SHA1 校验 → 必要时下载解压
-    file_name = '{name}-{short_hash}'.format(name=name, short_hash=short_hash(name))  # 拼接缓存文件名，形如 resnet50-25c4b509
+    name = _model_alias.get(name, name)  # 兼容旧接口名：resnet50 → resnet50s（新版仓库中的 deep_stem 权重）
+    file_name = '{name}-{short_hash}'.format(name=name, short_hash=short_hash(name))  # 拼接缓存文件名，形如 resnet50s-a75c83cf
     root = os.path.expanduser(root)  # 将 ~ 展开为用户主目录的绝对路径
 
     file_path = os.path.join(root, file_name + '.pth')  # 最终 .pth 权重文件的完整路径
@@ -52,7 +67,16 @@ def get_resnet_file(name, root='~/.torch/models'):  # 获取 ResNet 骨干权重
         else:  # 校验失败（文件损坏或不匹配）
             print('Mismatch in the content of model file {} detected.' +  # 【注意】bug：.format 只作用于下一行字符串，本行的 {} 占位符不会被填充，提示信息里不会出现文件名
                   ' Downloading again.'.format(file_path))  # 提示内容不匹配，将重新下载（格式化实际作用在无占位符的这段字符串上）
-    else:  # 本地不存在权重文件
+
+    # 兼容旧缓存：新版文件名不同，但旧权重与本工程 v1s 结构完全一致，本地有就直接复用
+    legacy_name = _legacy_alias.get(name)  # 新权重名 → 旧缓存名（如 resnet50s → resnet50）
+    if legacy_name is not None and legacy_name in _legacy_model_sha1:  # 该模型存在旧版权重记录
+        legacy_file = os.path.join(root, '{}-{}.pth'.format(legacy_name, _legacy_model_sha1[legacy_name][:8]))  # 旧缓存文件名，如 resnet50-25c4b509.pth
+        if os.path.exists(legacy_file) and check_sha1(legacy_file, _legacy_model_sha1[legacy_name]):  # 旧缓存存在且校验通过
+            print('Using legacy cached model file {}'.format(legacy_file))  # 提示复用旧缓存
+            return legacy_file  # 直接返回旧权重路径，免去下载
+
+    if not os.path.exists(file_path):  # 新版缓存与旧版缓存都不可用
         print('Model file {} is not found. Downloading.'.format(file_path))  # 提示未找到缓存，开始下载
 
     if not os.path.exists(root):  # 缓存目录不存在
