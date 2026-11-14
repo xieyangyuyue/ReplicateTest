@@ -36,6 +36,7 @@ class SegBaseModel(nn.Module):  # 分割模型公共基类：继承 nn.Module，
     # **kwargs：其余参数透传给骨干构造函数与 JPU（如 norm_layer、norm_kwargs）
     def __init__(self, nclass, aux, backbone='resnet50', jpu=False, pretrained_base=True, **kwargs):  # 构造基类：解析骨干类型并构建预训练网络
         super(SegBaseModel, self).__init__()  # 调用父类 nn.Module 构造函数，完成模块树初始化
+        kwargs.pop('local_rank', None)  # local_rank 只服务于 DDP/权重加载，ResNet 骨干构造函数不接受该参数
         dilated = False if jpu else True  # 膨胀开关：启用 JPU 时骨干不用空洞卷积（多尺度交给 JPU 处理），否则骨干用空洞卷积保持 1/8 分辨率
         self.aux = aux  # 记录辅助分支开关，供子类 forward / demo 判断
         self.nclass = nclass  # 记录分割类别数

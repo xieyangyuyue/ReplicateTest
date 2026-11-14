@@ -97,11 +97,22 @@ class Evaluator(object):  # 评估器类：封装验证数据加载、模型构�
                 predict = pred.squeeze(0)  # 去掉 batch 维，得到 (H, W) 的类别索引图
                 mask = get_color_pallete(predict, self.args.dataset)  # 按数据集调色板将索引图着色为 PIL 彩色图
                 mask.save(os.path.join(outdir, os.path.splitext(filename[0])[0] + '.png'))  # 以原文件名（去扩展名）保存为 PNG；【注意】outdir 是 __main__ 中的全局变量，类方法内直接引用，写法不规范（应作为参数传入）
+        self.metric.all_reduce()  # 多卡评估：合并各 rank 的统计量，得到全局指标（所有 rank 必须同时调用）
+        if get_rank() == 0:  # 仅主进程打印全局最终指标
+            scores = self.metric.get_scores()  # 取出全部指标
+            pixAcc, mIoU = self.metric.get()  # 兼容旧接口
+            logger.info("Final validation pixAcc: {:.3f}, mIoU: {:.3f}, mPA: {:.3f}, FWIoU: {:.3f}, mF1: {:.3f}".format(
+                pixAcc * 100, mIoU * 100, scores['mean_pixel_accuracy'] * 100,  # 百分比口径
+                scores['frequency_weighted_iou'] * 100, scores['mean_f1'] * 100))  # 与逐样本日志保持一致
         synchronize()  # 分布式屏障：等待所有进程完成评估，保证日志与预测图全部落盘
 
 
 if __name__ == '__main__':  # 脚本直接执行时的入口（被 import 时不运行）
     args = parse_args()  # 复用 train.py 的参数解析
+    if 'LOCAL_RANK' in os.environ:  # torchrun / 新版 launcher 通过环境变量注入本地 rank
+        args.local_rank = int(os.environ['LOCAL_RANK'])  # 使用环境变量中的本地 rank
+    elif args.local_rank < 0:  # 未注入且参数为负
+        args.local_rank = 0  # 回退到 0 号 GPU
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1  # 从环境变量读进程总数（分布式启动器注入），未注入则视为单机单卡
     args.distributed = num_gpus > 1  # 进程数大于 1 即启用分布式评估
     if not args.no_cuda and torch.cuda.is_available():  # 未禁用 CUDA 且 GPU 可用时
@@ -111,6 +122,10 @@ if __name__ == '__main__':  # 脚本直接执行时的入口（被 import 时不
         args.distributed = False  # CPU 环境强制关闭分布式
         args.device = "cpu"  # 使用 CPU 评估
     if args.distributed:  # 初始化分布式评估环境
+        if args.local_rank >= torch.cuda.device_count():  # 本地 rank 超出可见 GPU 数量
+            raise RuntimeError(  # 提前给出明确错误
+                'local_rank={} >= visible GPU count={}. Check CUDA_VISIBLE_DEVICES and --nproc_per_node.'.format(
+                    args.local_rank, torch.cuda.device_count()))
         torch.cuda.set_device(args.local_rank)  # 绑定当前进程使用的 GPU
         torch.distributed.init_process_group(backend="nccl", init_method="env://")  # 以 NCCL 后端、环境变量寻址方式初始化进程组
         synchronize()  # 等待全部进程完成初始化

@@ -11,6 +11,7 @@
 # 【注意】与原论文差异：VGG 的 fc6/fc7 全连接被替换为 _FCNHead 卷积头（见 FCN32s docstring）。
 # ============================================================================
 import os  # 【注意】未使用的导入：本文件实际并未直接使用 os 模块
+import warnings  # 用于在 fcn8s + resnet 自动映射到 FCNv2 时给出提示
 import torch  # PyTorch 主模块：用于 torch.device 指定设备与 torch.load 加载权重
 import torch.nn as nn  # 神经网络模块：提供 nn.Module、nn.Sequential、Conv2d、BN 等层
 import torch.nn.functional as F  # 函数式接口：用于 F.interpolate 双线性上采样
@@ -194,6 +195,10 @@ class _FCNHead(nn.Module):  # FCN 分割头：替代原论文 VGG 的 fc6/fc7 �
 # **kwargs：透传给 FCN32s（如 aux、norm_layer、local_rank 等）
 def get_fcn32s(dataset='pascal_voc', backbone='vgg16', pretrained=False, root='~/.torch/models',  # FCN32s 通用工厂函数
                pretrained_base=True, **kwargs):  # 续行：默认加载骨干 ImageNet 预训练权重
+    if backbone != 'vgg16':  # fcn.py 中的 FCN32s 是按 VGG16 的 pool5(1/32、512 通道) 硬编码的
+        raise RuntimeError(  # 给出比“unknown backbone”更明确的指引
+            "FCN32s in core/models/fcn.py only supports backbone='vgg16'. "  # 说明限制
+            "For ResNet backbones use --model fcn (FCNv2, output stride 8) instead.")  # 推荐替代方案
     acronyms = {  # 数据集名 → 权重文件命名缩写映射表
         'pascal_voc': 'pascal_voc',  # Pascal VOC（原生标注）
         'pascal_aug': 'pascal_aug',  # Pascal VOC 增强标注（SBD）
@@ -216,6 +221,10 @@ def get_fcn32s(dataset='pascal_voc', backbone='vgg16', pretrained=False, root='~
 # 参数含义同 get_fcn32s：dataset/backbone/pretrained/root/pretrained_base/**kwargs
 def get_fcn16s(dataset='pascal_voc', backbone='vgg16', pretrained=False, root='~/.torch/models',  # FCN16s 通用工厂函数
                pretrained_base=True, **kwargs):  # 续行：默认加载骨干 ImageNet 预训练权重
+    if backbone != 'vgg16':  # FCN16s 依赖 VGG16 的 pool4/pool5 层级结构
+        raise RuntimeError(  # 给出明确指引
+            "FCN16s in core/models/fcn.py only supports backbone='vgg16'. "  # 说明限制
+            "For ResNet backbones use --model fcn (FCNv2, output stride 8) instead.")  # 推荐替代方案
     acronyms = {  # 数据集名 → 权重文件命名缩写映射表
         'pascal_voc': 'pascal_voc',  # Pascal VOC（原生标注）
         'pascal_aug': 'pascal_aug',  # Pascal VOC 增强标注（SBD）
@@ -238,6 +247,19 @@ def get_fcn16s(dataset='pascal_voc', backbone='vgg16', pretrained=False, root='~
 # 参数含义同 get_fcn32s：dataset/backbone/pretrained/root/pretrained_base/**kwargs
 def get_fcn8s(dataset='pascal_voc', backbone='vgg16', pretrained=False, root='~/.torch/models',  # FCN8s 通用工厂函数
               pretrained_base=True, **kwargs):  # 续行：默认加载骨干 ImageNet 预训练权重
+    if backbone != 'vgg16':  # fcn.py 的 FCN8s 是按 VGG16 的 pool3/pool4/pool5 硬编码的
+        if backbone in ('resnet50', 'resnet101', 'resnet152'):  # ResNet 系列有现成的 stride-8 FCN 实现
+            warnings.warn(  # 提示用户实际使用的是 FCNv2 架构
+                "FCN8s in core/models/fcn.py only supports VGG16. "  # 说明 fcn.py 的限制
+                "backbone='{}' is automatically routed to FCNv2 (output stride 8) from fcnv2.py. "  # 说明自动映射
+                "For explicit control use --model fcn --backbone {}.".format(backbone, backbone),  # 推荐显式写法
+                RuntimeWarning, stacklevel=2)  # 以 RuntimeWarning 提示调用方
+            from .fcnv2 import get_fcn  # 延迟导入，避免模块级循环依赖
+            return get_fcn(dataset=dataset, backbone=backbone, pretrained=pretrained,  # 转交给 FCNv2 工厂
+                           root=root, pretrained_base=pretrained_base, **kwargs)  # 其余参数原样透传
+        raise RuntimeError(  # 非 vgg16 且非 resnet50/101/152
+            "FCN8s only supports backbone='vgg16', or resnet50/resnet101/resnet152 "  # 列出支持范围
+            "(which are routed to FCNv2 stride-8).")  # 说明 ResNet 会被映射
     acronyms = {  # 数据集名 → 权重文件命名缩写映射表
         'pascal_voc': 'pascal_voc',  # Pascal VOC（原生标注）
         'pascal_aug': 'pascal_aug',  # Pascal VOC 增强标注（SBD）

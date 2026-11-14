@@ -91,6 +91,7 @@ def get_fcn(dataset='pascal_voc', backbone='resnet50', pretrained=False, root='~
         'ade20k': 'ade',  # ADE20K 缩写为 ade
         'coco': 'coco',  # COCO
         'citys': 'citys',  # Cityscapes
+        'sbu': 'sbu',  # SBU Shadow（补齐与 fcn.py 一致的数据集支持）
     }  # 数据集缩写映射表结束
     from ..data.dataloader import datasets  # 局部导入数据集注册表（避免循环依赖）
     model = FCN(datasets[dataset].NUM_CLASS, backbone=backbone, pretrained_base=pretrained_base, **kwargs)  # 按数据集类别数实例化 FCN

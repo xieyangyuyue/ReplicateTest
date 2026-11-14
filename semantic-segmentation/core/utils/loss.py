@@ -161,8 +161,8 @@ class OhemCrossEntropy2d(nn.Module):  # OHEM 在线难例挖掘交叉熵（2D �
         if self.min_kept > num_valid:  # 有效像素数少于最少保留数
             print("Lables: {}".format(num_valid))  # 仅打印提示，跳过难例筛选；【注意】"Lables" 拼写错误（应为 Labels），且用 print 而非 logger
         elif num_valid > 0:  # 存在有效像素才进行难例筛选
-            prob = prob.masked_fill_(1 - valid_mask, 1)  # 无效像素概率填 1（最"简单"）以确保不被选为难例；【注意】对 bool 张量做减法在新版 PyTorch 中会报错，应写 ~valid_mask
-            mask_prob = prob[target, torch.arange(len(target), dtype=torch.long)]  # 花式索引取每个像素在其真实类别上的预测概率: (N*H*W,)，值越小说明越难分
+            prob = prob.masked_fill_(~valid_mask, 1)  # 无效像素概率填 1（最"简单"）以确保不被选为难例；用 ~ 取反，兼容新版 PyTorch 禁止 bool 减法的限制
+            mask_prob = prob[target, torch.arange(len(target), dtype=torch.long, device=target.device)]  # 花式索引取每个像素在其真实类别上的预测概率: (N*H*W,)，索引张量必须与 target 同设备
             threshold = self.thresh  # 初始阈值取 0.7
             if self.min_kept > 0:  # 需要保证最少保留 min_kept 个像素
                 index = mask_prob.argsort()  # 按概率升序排序（最难的排最前）
@@ -173,7 +173,7 @@ class OhemCrossEntropy2d(nn.Module):  # OHEM 在线难例挖掘交叉熵（2D �
             valid_mask = valid_mask * kept_mask  # 最终参与损失的像素 = 有效 且 属于难例
             target = target * kept_mask.long()  # 未保留像素的标签置 0
 
-        target = target.masked_fill_(1 - valid_mask, self.ignore_index)  # 未保留/无效像素的标签统一改回 ignore_index，使 CE 彻底忽略它们；【注意】1 - bool 减法同上，新版应写 ~valid_mask
+        target = target.masked_fill_(~valid_mask, self.ignore_index)  # 未保留/无效像素的标签统一改回 ignore_index，使 CE 彻底忽略它们
         target = target.view(n, h, w)  # 标签还原为 (N,H,W) 形状
 
         return self.criterion(pred, target)  # 用（可选类别加权的）CE 在保留下来的难例像素上计算损失

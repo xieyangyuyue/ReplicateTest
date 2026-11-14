@@ -208,8 +208,8 @@ def make_data_sampler(dataset, shuffle, distributed):
 # 参数：sampler——底层样本级采样器；images_per_batch——每个 batch 的图片数；
 #      num_iters——总迭代步数（None 表示按 epoch 跑完整个采样器）；start_iter——起始迭代号（断点续训用）
 # 作用：把样本流切成 batch（返回给 DataLoader 的 batch_sampler 参数）
-def make_batch_data_sampler(sampler, images_per_batch, num_iters=None, start_iter=0):
-    batch_sampler = data.sampler.BatchSampler(sampler, images_per_batch, drop_last=True)  # 把采样器产出的索引切成 batch；drop_last 丢弃不满一个 batch 的尾部，保证各进程 batch 数一致（避免集合通信对不齐而死锁）
+def make_batch_data_sampler(sampler, images_per_batch, num_iters=None, start_iter=0, drop_last=True):
+    batch_sampler = data.sampler.BatchSampler(sampler, images_per_batch, drop_last=drop_last)  # 把采样器产出的索引切成 batch；训练默认 drop_last=True 保证各进程 batch 数一致，验证可传 False 保留最后一批
     if num_iters is not None:  # 指定了按迭代步数训练
         batch_sampler = IterationBasedBatchSampler(batch_sampler, num_iters, start_iter)  # 包装成“循环取数直到满 num_iters 步”的批采样器
     return batch_sampler  # 返回可直接交给 DataLoader(batch_sampler=...) 的批采样器

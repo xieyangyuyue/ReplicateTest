@@ -1,7 +1,9 @@
 # ============================================================================
 # 【文件说明】score.py —— 语义分割评价指标：核心类 SegmentationMetric 在验证过程中
-#             逐 batch 累计"像素正确数/标记数"与"各类别交集/并集面积"，最终给出
-#             pixAcc（像素准确率）与 mIoU（平均交并比）；另附 PyTorch 版批量函数
+#             逐 batch 累计"像素正确数/标记数"与"各类别交集/并集/预测面积/标签面积"，
+#             最终给出 pixAcc（像素准确率）、mIoU（平均交并比）、mPA（平均像素准确率）、
+#             FWIoU（频率加权 IoU）、mF1（平均 F1）与逐类 IoU；支持多卡 all_reduce。
+#             另附 PyTorch 版批量函数
 #             batch_pix_accuracy / batch_intersection_union、numpy 版单图函数
 #             pixelAccuracy / intersectionAndUnion、混淆矩阵构建 hist_info 与
 #             指标计算 compute_score。
@@ -42,24 +44,31 @@ class SegmentationMetric(object):  # 分割指标累计器：跨 batch 累计混
         preds : 'NumpyArray' or list of `NumpyArray`
             Predicted values.
         """  # 原有 docstring 原样保留：说明输入可为数组或数组列表
-
-        def evaluate_worker(self, pred, label):  # 内部工作函数：处理一对 (预测, 标签) 并完成累计（self 由外部闭包显式传入）
-            correct, labeled = batch_pix_accuracy(pred, label)  # 本对数据的 (正确像素数, 有效标记像素数)
-            inter, union = batch_intersection_union(pred, label, self.nclass)  # 各类别交集/并集面积向量 (nclass,)
-
-            self.total_correct += correct  # 累加正确像素数
-            self.total_label += labeled  # 累加有效标记像素数
-            if self.total_inter.device != inter.device:  # 若累计向量与当前 batch 所在设备不一致
-                self.total_inter = self.total_inter.to(inter.device)  # 把累计交集向量搬到当前设备
-                self.total_union = self.total_union.to(union.device)  # 把累计并集向量搬到当前设备
-            self.total_inter += inter  # 累加各类别交集面积
-            self.total_union += union  # 累加各类别并集面积
-
         if isinstance(preds, torch.Tensor):  # 输入是单个张量：整个 batch 一次统计
-            evaluate_worker(self, preds, labels)  # 直接处理该 batch
+            self._update_one(preds, labels)  # 直接处理该 batch
         elif isinstance(preds, (list, tuple)):  # 输入是列表/元组：逐张图分别统计
             for (pred, label) in zip(preds, labels):  # 成对遍历预测与标签
-                evaluate_worker(self, pred, label)  # 逐张累计结果
+                self._update_one(pred, label)  # 逐张累计结果
+        else:  # 不支持的类型
+            raise TypeError("preds should be a torch.Tensor or a list/tuple of tensors")  # 明确报错，避免静默漏统计
+
+    def _update_one(self, pred, label):  # 内部工作函数：处理一对 (预测, 标签) 并完成累计
+        correct, labeled = batch_pix_accuracy(pred, label)  # 本对数据的 (正确像素数, 有效标记像素数)
+        inter, union, area_pred, area_lab = batch_intersection_union(  # 各类别交集/并集/预测面积/标签面积
+            pred, label, self.nclass, return_counts=True)  # return_counts=True 额外返回逐类预测数与标签数，用于 mPA/F1/FWIoU
+
+        self.total_correct += correct  # 累加正确像素数
+        self.total_label += labeled  # 累加有效标记像素数
+        device = inter.device  # 当前统计结果所在设备（batch_intersection_union 内 histc 在 CPU 上执行）
+        if self.total_inter.device != device:  # 若累计向量与当前 batch 所在设备不一致
+            self.total_inter = self.total_inter.to(device)  # 把累计交集向量搬到当前设备
+            self.total_union = self.total_union.to(device)  # 把累计并集向量搬到当前设备
+            self.total_pred = self.total_pred.to(device)  # 把累计逐类预测数搬到当前设备
+            self.total_label_per_class = self.total_label_per_class.to(device)  # 把累计逐类标签数搬到当前设备
+        self.total_inter += inter  # 累加各类别交集面积（TP）
+        self.total_union += union  # 累加各类别并集面积（TP + FP + FN）
+        self.total_pred += area_pred  # 累加各类别预测像素数（TP + FP）
+        self.total_label_per_class += area_lab  # 累加各类别真实像素数（TP + FN）
 
     def get(self):  # 获取累计口径下的最终指标
         # docstring：获取当前累计的评估结果（返回 pixAcc 与 mIoU）
@@ -70,15 +79,92 @@ class SegmentationMetric(object):  # 分割指标累计器：跨 batch 累计混
         metrics : tuple of float
             pixAcc and mIoU
         """  # 原有 docstring 原样保留：返回 (pixAcc, mIoU)
-        pixAcc = 1.0 * self.total_correct / (2.220446049250313e-16 + self.total_label)  # remove np.spacing(1)  # pixAcc = 累计正确像素 / 累计有效像素；2.220446049250313e-16 即双精度机器精度 np.spacing(1)，用于防除零（原英文注释保留）
-        IoU = 1.0 * self.total_inter / (2.220446049250313e-16 + self.total_union)  # 各类 IoU = 累计交集 / 累计并集（同样加 eps 防除零）
-        mIoU = IoU.mean().item()  # mIoU = 各类 IoU 的均值（.item() 转为 Python 标量）
-        return pixAcc, mIoU  # 返回 (像素准确率, 平均交并比)
+        return self.pixel_accuracy(), self.mean_intersection_over_union()  # 保持旧接口不变，供 eval.py / train.py 直接复用
+
+    def pixel_accuracy(self):  # 像素准确率（全局口径）
+        return 1.0 * self.total_correct / (2.220446049250313e-16 + self.total_label)  # 正确像素 / 有效像素；eps 防除零
+
+    def class_pixel_accuracy(self):  # 逐类别像素准确率（即召回率 recall = TP / (TP + FN)）
+        return self.total_inter / (self.total_label_per_class + 2.220446049250313e-16)  # 逐类正确数 / 该类真实像素数
+
+    def mean_pixel_accuracy(self):  # 平均像素准确率 mPA：只对真实标注中出现过的类别求平均
+        class_acc = self.class_pixel_accuracy()  # 逐类召回率
+        valid = self.total_label_per_class > 0  # 忽略验证集中从未出现的类别，避免其 0 值拉低均值
+        if valid.any():  # 至少存在一个有效类别
+            return class_acc[valid].mean().item()  # 有效类别的平均召回率
+        return 0.0  # 空验证集或无有效类别时返回 0
+
+    def intersection_over_union(self):  # 逐类别 IoU
+        return self.total_inter / (self.total_union + 2.220446049250313e-16)  # TP / (TP + FP + FN)
+
+    def mean_intersection_over_union(self):  # 平均交并比 mIoU：只对验证集中出现过的类别求平均
+        iou = self.intersection_over_union()  # 逐类 IoU
+        valid = self.total_union > 0  # 并集为 0 说明该类在预测和标签中都没出现
+        if valid.any():  # 至少存在一个有效类别
+            return iou[valid].mean().item()  # 有效类别的平均 IoU
+        return 0.0  # 空验证集时返回 0
+
+    def frequency_weighted_iou(self):  # 频率加权交并比 FWIoU：按各类真实像素频率对 IoU 加权
+        total = self.total_label_per_class.sum()  # 全部有效像素数
+        if total <= 0:  # 没有有效像素
+            return 0.0  # 返回 0，避免除零
+        freq = self.total_label_per_class / total  # 各类别在真实标签中的出现频率
+        iou = self.intersection_over_union()  # 逐类 IoU
+        valid = freq > 0  # 只统计出现过的类别
+        return (freq[valid] * iou[valid]).sum().item()  # 频率加权求和
+
+    def class_f1_score(self):  # 逐类别 F1 = 2TP / (2TP + FP + FN)
+        return 2 * self.total_inter / (  # 分子 2TP
+            self.total_pred + self.total_label_per_class + 2.220446049250313e-16)  # 分母 (TP+FP) + (TP+FN) = 2TP+FP+FN，加 eps 防除零
+
+    def mean_f1_score(self):  # 平均 F1：只对出现过的类别求平均
+        f1 = self.class_f1_score()  # 逐类 F1
+        valid = (self.total_pred + self.total_label_per_class) > 0  # 预测与标签都为空的类别不参与平均
+        if valid.any():  # 至少存在一个有效类别
+            return f1[valid].mean().item()  # 有效类别的平均 F1
+        return 0.0  # 空验证集时返回 0
+
+    def get_scores(self):  # 一次性返回全部指标，便于训练日志与模型选优统一读取
+        return {
+            'pixel_accuracy': float(self.pixel_accuracy()),  # 像素准确率 pixAcc
+            'mean_pixel_accuracy': self.mean_pixel_accuracy(),  # 平均像素准确率 mPA
+            'mean_iou': self.mean_intersection_over_union(),  # 平均交并比 mIoU
+            'frequency_weighted_iou': self.frequency_weighted_iou(),  # 频率加权交并比 FWIoU
+            'mean_f1': self.mean_f1_score(),  # 平均 F1
+            'class_iou': self.intersection_over_union().tolist(),  # 逐类 IoU（保留原始数值，便于离线分析）
+        }
+
+    def all_reduce(self):  # 分布式验证：把各 rank 的累计统计量求和，得到全局指标
+        """All-reduce the accumulated statistics across all processes."""
+        import torch.distributed as dist  # 延迟导入，单卡/非分布式环境无需关心
+        if not dist.is_available() or not dist.is_initialized():  # 分布式未初始化
+            return self  # 单进程直接返回
+        if dist.get_world_size() <= 1:  # 只有 1 个进程
+            return self  # 无需通信
+        if dist.get_backend() == 'nccl':  # NCCL 只支持 CUDA 张量
+            device = torch.device('cuda', torch.cuda.current_device())  # 使用当前进程绑定的 GPU
+        else:  # gloo 等后端
+            device = torch.device('cpu')  # 使用 CPU 张量通信
+        keys = ['total_inter', 'total_union', 'total_pred', 'total_label_per_class']  # 需要跨进程求和的逐类统计量
+        tensors = [getattr(self, key).to(device) for key in keys]  # 搬移到通信设备
+        for tensor in tensors:  # 逐张量执行 SUM all-reduce
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)  # 各 rank 求和 = 全局统计量
+        for key, tensor in zip(keys, tensors):  # 把全局统计量写回对象（统一放回 CPU，保持原有行为）
+            setattr(self, key, tensor.cpu())  # 逐类统计量回到 CPU
+        correct = torch.tensor(float(self.total_correct), dtype=torch.float64, device=device)  # 正确像素总数
+        labeled = torch.tensor(float(self.total_label), dtype=torch.float64, device=device)  # 有效像素总数
+        dist.all_reduce(correct, op=dist.ReduceOp.SUM)  # 求和正确像素
+        dist.all_reduce(labeled, op=dist.ReduceOp.SUM)  # 求和有效像素
+        self.total_correct = int(correct.item())  # 写回 Python int
+        self.total_label = int(labeled.item())  # 写回 Python int
+        return self  # 返回自身便于链式调用
 
     def reset(self):  # 重置所有累计器到初始状态
         """Resets the internal evaluation result to initial state."""  # 原有 docstring：重置内部评估结果
-        self.total_inter = torch.zeros(self.nclass)  # 各类别交集面积累计向量清零 (nclass,)
-        self.total_union = torch.zeros(self.nclass)  # 各类别并集面积累计向量清零 (nclass,)
+        self.total_inter = torch.zeros(self.nclass, dtype=torch.float64)  # 各类别交集面积累计向量清零 (nclass,)，float64 防止大验证集累加精度损失
+        self.total_union = torch.zeros(self.nclass, dtype=torch.float64)  # 各类别并集面积累计向量清零 (nclass,)
+        self.total_pred = torch.zeros(self.nclass, dtype=torch.float64)  # 各类别预测像素数累计向量清零 (nclass,)
+        self.total_label_per_class = torch.zeros(self.nclass, dtype=torch.float64)  # 各类别真实像素数累计向量清零 (nclass,)
         self.total_correct = 0  # 正确像素数清零
         self.total_label = 0  # 有效标记像素数清零
 
@@ -87,7 +173,7 @@ class SegmentationMetric(object):  # 分割指标累计器：跨 batch 累计混
 def batch_pix_accuracy(output, target):  # 计算一个 batch 的 (正确像素数, 有效标记像素数)
     """PixAcc"""  # 原有 docstring：像素准确率
     # inputs are numpy array, output 4D, target 3D  # 原注释保留：输入说明（output 为 4D logits，target 为 3D 标签）
-    predict = torch.argmax(output.long(), 1) + 1  # 类别维 argmax 得预测标签后整体 +1；【注意】可疑写法：先 .long() 截断 logits 小数再 argmax，可能因截断后并列而改变 argmax 结果（如 0.9 与 0.95 均截为 0），且与 batch_intersection_union 中不带 .long() 的写法不一致
+    predict = torch.argmax(output, 1) + 1  # 类别维 argmax 得预测标签后整体 +1（直接对浮点 logits 取 argmax，避免先 .long() 截断造成并列）
     target = target.long() + 1  # 标签 +1：使忽略值 -1 变为 0，从而可用 target > 0 识别有效像素
 
     pixel_labeled = torch.sum(target > 0).item()  # 有效（被标注）像素总数
@@ -96,9 +182,11 @@ def batch_pix_accuracy(output, target):  # 计算一个 batch 的 (正确像素�
     return pixel_correct, pixel_labeled  # 返回 (正确像素数, 有效标记数)
 
 
-def batch_intersection_union(output, target, nclass):  # 计算各类别的交集与并集像素面积
+def batch_intersection_union(output, target, nclass, return_counts=False):  # 计算各类别的交集与并集像素面积
     """mIoU"""  # 原有 docstring：平均交并比
     # inputs are numpy array, output 4D, target 3D  # 原注释保留：输入说明
+    # return_counts=True 时额外返回逐类预测面积 area_pred 与逐类标签面积 area_lab，
+    # 用于在 SegmentationMetric 中计算 mPA / F1 / FWIoU；默认 False 保持旧接口兼容。
     mini = 1  # 直方图统计下界：类别 +1 后的最小有效类别值 1
     maxi = nclass  # 直方图统计上界：类别 +1 后的最大类别值 nclass
     nbins = nclass  # 直方图 bin 数：每个类别一个 bin
@@ -114,6 +202,8 @@ def batch_intersection_union(output, target, nclass):  # 计算各类别的交�
     area_lab = torch.histc(target.cpu(), bins=nbins, min=mini, max=maxi)  # 标签直方图：各类别的真实像素数 (nclass,)
     area_union = area_pred + area_lab - area_inter  # 容斥原理：并集 = 预测面积 + 标签面积 - 交集面积
     assert torch.sum(area_inter > area_union).item() == 0, "Intersection area should be smaller than Union area"  # 断言：任一类别的交集不超过并集
+    if return_counts:  # 额外返回逐类预测/标签面积
+        return area_inter.float(), area_union.float(), area_pred.float(), area_lab.float()  # (交集, 并集, 预测面积, 标签面积)
     return area_inter.float(), area_union.float()  # 返回各类别 (交集面积, 并集面积)，均转 float
 
 
