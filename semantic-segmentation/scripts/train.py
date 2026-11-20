@@ -4,11 +4,13 @@
 #               vgg/resnet/densenet 等 backbone 的组合，覆盖 pascal_voc、
 #               pascal_aug、ade20k、citys、sbu 五个数据集；包含 warmup+poly
 #               学习率调度、OHEM 与辅助损失、AMP 混合精度、SyncBN/DDP 分布式训练、
-#               tqdm 实时进度条（训练每个 iteration 刷新 loss/lr/epoch，验证实时刷新
-#               pixAcc/mIoU）、checkpoint 保存与日志管理。
+#               tqdm 实时进度条（训练每个 iteration 刷新 loss/lr/epoch，验证按 10% 间隔
+#               刷新 pixAcc/mIoU）、W&B 实验跟踪与模型/日志 Artifact 上传、
+#               checkpoint 保存与日志管理。
 # 【运行方式】单卡：python train.py --model fcn --backbone resnet50 --dataset pascal_voc --amp
 #               多卡：torchrun --nproc_per_node=N train.py ... --amp
 #               或旧版：python -m torch.distributed.launch --nproc_per_node=N train.py ... --amp
+#               W&B：在上面命令末尾加 --wandb [--wandb-project ReplicateTest]
 #               （脚本会自动把项目根目录加入 sys.path，工作目录不限）
 # 【注意】FCN32s/16s/8s 在 core/models/fcn.py 中基于 VGG16；ResNet 骨干请用 --model fcn
 #         （FCNv2，stride 8）。为了兼容旧命令，--model fcn8s --backbone resnet50 会自动
@@ -43,6 +45,11 @@ try:  # 进度条库：优先使用 tqdm；环境未安装时降级为静默进�
 except ImportError:  # 未安装 tqdm
     tqdm = None  # 置为 None，后续按需走静默分支
     logging_redirect_tqdm = None  # 无 tqdm 时也没有日志重定向上下文
+
+try:  # W&B 实验跟踪：Kaggle 上通常已预装；本地缺失时自动跳过，不影响训练
+    import wandb  # Weights & Biases SDK
+except ImportError:  # 未安装 wandb
+    wandb = None  # 置为 None，--wandb 会退化为普通训练
 
 from torchvision import transforms  # 图像变换库：构建 ToTensor + Normalize 输入预处理流水线
 from core.data.dataloader import get_segmentation_dataset  # 数据集工厂函数：按名称创建训练/验证 Dataset
@@ -118,6 +125,136 @@ def autocast_context(device_type, enabled):  # 创建 autocast 上下文，兼�
     return torch.cuda.amp.autocast(enabled=enabled)  # 旧版接口（仅在 CUDA 上启用）
 
 
+# ============================================================================
+# Weights & Biases 集成
+# 设计原则：
+#   1) 只有 rank 0 初始化/记录/结束，避免多进程重复写同一个 run；
+#   2) 所有 W&B 调用都包在 try/except 中，网络异常或未登录时只告警，不中断训练；
+#   3) 项目名固定（默认 ReplicateTest），用 run name + group + tags 区分不同实验；
+#   4) 训练结束把 best_model 与 runs/log 下的日志作为 Artifact 上传，方便在 Kaggle
+#      会话结束后仍然取回模型和日志。
+# ============================================================================
+_WANDB_RUN = None  # 当前 W&B run 对象（仅 rank 0 非空）
+
+
+def default_wandb_run_name(args):  # 根据训练参数自动生成可读且唯一的 run 名
+    # 例：fcn-resnet50-pascal_voc-ddp2-lr0.0001-bs4x2-ep100-amp-20261118-173000
+    lr = getattr(args, 'base_lr', args.lr)  # 使用未按 GPU 数放大的原始学习率，便于横向比较
+    parts = [
+        str(args.model),  # 模型
+        str(args.backbone),  # 骨干
+        str(args.dataset),  # 数据集
+        'ddp{}'.format(getattr(args, 'num_gpus', 1)),  # GPU 数量
+        'lr{}'.format(lr),  # 原始学习率
+        'bs{}x{}'.format(args.batch_size, getattr(args, 'num_gpus', 1)),  # 每卡批大小 x 卡数
+        'ep{}'.format(args.epochs),  # 训练轮数
+        'amp' if getattr(args, 'amp', False) else 'fp32',  # 精度模式
+        time.strftime('%Y%m%d-%H%M%S'),  # 时间戳：同名配置多次运行也不会冲突
+    ]
+    return '-'.join(parts)  # 用短横线连接，避免空格
+
+
+def init_wandb(args, logger):  # 初始化 W&B run（仅 rank 0）
+    global _WANDB_RUN
+    if not getattr(args, 'wandb', False):  # 未开启 --wandb
+        return None  # 直接返回，不产生任何副作用
+    if get_rank() != 0:  # 非主进程
+        return None  # 不初始化，避免重复 run
+    if wandb is None:  # 环境未安装 wandb
+        logger.warning('wandb is not installed; W&B logging is disabled. Run: pip install wandb')  # 只告警
+        return None  # 不影响训练
+    try:
+        run_name = args.wandb_run_name or default_wandb_run_name(args)  # 命令行优先，否则自动生成
+        group = args.wandb_group or '{}_{}_{}'.format(args.model, args.backbone, args.dataset)  # 同配置归组
+        tags = [args.model, args.backbone, args.dataset,  # 基础标签
+                'ddp{}'.format(getattr(args, 'num_gpus', 1)),  # GPU 数
+                'amp' if getattr(args, 'amp', False) else 'fp32']  # 精度模式
+        if args.wandb_tags:  # 用户额外标签
+            tags.extend([t.strip() for t in args.wandb_tags.split(',') if t.strip()])  # 逗号分隔并去除空白
+        config = {  # 记录完整超参，便于在 W&B 中筛选/对比
+            'model': args.model, 'backbone': args.backbone, 'dataset': args.dataset,  # 模型与数据
+            'epochs': args.epochs, 'batch_size_per_gpu': args.batch_size,  # 训练规模
+            'val_batch_size_per_gpu': args.val_batch_size,  # 验证批大小
+            'base_lr': getattr(args, 'base_lr', args.lr),  # 原始学习率
+            'effective_lr': args.lr,  # 按 GPU 数放大后的实际学习率
+            'num_gpus': getattr(args, 'num_gpus', 1),  # GPU 数
+            'amp': getattr(args, 'amp', False), 'best_metric': args.best_metric,  # 精度与选优指标
+            'crop_size': args.crop_size, 'base_size': args.base_size,  # 输入尺寸
+            'workers': args.workers,  # 数据加载进程数
+            'save_dir': os.path.expanduser(args.save_dir), 'log_dir': os.path.expanduser(args.log_dir),  # 输出目录
+        }
+        wandb_dir = os.path.join(os.path.expanduser(args.log_dir), 'wandb')  # W&B 自身文件放在日志目录下，便于一起打包
+        os.makedirs(wandb_dir, exist_ok=True)  # 确保目录存在
+        init_kwargs = dict(project=args.wandb_project, name=run_name,  # 项目与运行名
+                           group=group, tags=tags,  # 分组/标签：区分不同实验
+                           config=config, dir=wandb_dir)  # 超参配置与本地目录
+        if args.wandb_entity:  # 仅显式指定团队时传入
+            init_kwargs['entity'] = args.wandb_entity  # W&B entity
+        if args.wandb_mode:  # 仅在显式指定时传 mode，兼容旧版 wandb
+            init_kwargs['mode'] = args.wandb_mode  # online / offline / disabled
+        _WANDB_RUN = wandb.init(**init_kwargs)  # 创建 run
+        logger.info('W&B initialized: project={}, run={}, group={}'.format(  # 记录初始化信息
+            args.wandb_project, run_name, group))
+    except Exception as exc:  # 登录失败/网络异常等
+        logger.warning('W&B initialization failed ({}); continue without W&B.'.format(exc))  # 只告警
+        _WANDB_RUN = None  # 确保后续调用直接跳过
+    return _WANDB_RUN
+
+
+def wandb_log(metrics, step=None):  # 安全地记录标量（未初始化时静默跳过）
+    if _WANDB_RUN is None:  # 未启用 W&B
+        return  # 直接返回
+    try:
+        _WANDB_RUN.log(metrics, step=step)  # 记录到当前 run
+    except Exception:  # 网络抖动等异常不应中断训练
+        pass  # 静默忽略
+
+
+def finish_wandb(args, logger):  # 结束 W&B：上传 best_model 与日志 Artifact，然后 finish
+    global _WANDB_RUN
+    if _WANDB_RUN is None:  # 未初始化
+        return  # 直接返回
+    try:
+        if not args.no_wandb_save_model:  # 默认上传最优模型
+            best_path = os.path.join(  # best_model 的完整路径（与 save_checkpoint 命名保持一致）
+                os.path.expanduser(args.save_dir),
+                '{}_{}_{}_best_model.pth'.format(args.model, args.backbone, args.dataset))
+            if os.path.isfile(best_path):  # 训练过程中确实产生过 best_model
+                artifact = wandb.Artifact(  # 定义模型制品
+                    name='{}-{}-{}-best-model'.format(args.model, args.backbone, args.dataset),  # 制品名
+                    type='model',  # 类型：模型
+                    metadata={'best_metric': args.best_metric,  # 选优指标
+                              'effective_lr': args.lr, 'num_gpus': getattr(args, 'num_gpus', 1)})  # 关键超参
+                artifact.add_file(best_path)  # 加入权重文件
+                _WANDB_RUN.log_artifact(artifact)  # 上传（大模型可能耗时较久）
+                logger.info('Uploaded best model to W&B artifact: {}'.format(best_path))  # 记录上传结果
+            else:  # 没有 best_model（例如 --skip-val）
+                logger.warning('best model not found, skip W&B model artifact: {}'.format(best_path))  # 只告警
+        if not args.no_wandb_save_logs:  # 默认上传日志
+            log_dir = os.path.expanduser(args.log_dir)  # 日志目录（即 runs/log）
+            if os.path.isdir(log_dir):  # 目录存在
+                artifact = wandb.Artifact(  # 定义日志制品
+                    name='{}-{}-{}-logs'.format(args.model, args.backbone, args.dataset),  # 制品名
+                    type='logs')  # 类型：日志
+                added = 0  # 已添加文件计数
+                for name in sorted(os.listdir(log_dir)):  # 只挑日志文本，避免把 checkpoint/图像等大文件打进去
+                    path = os.path.join(log_dir, name)  # 完整路径
+                    if os.path.isfile(path) and name.endswith('.txt'):  # 日志文件
+                        artifact.add_file(path)  # 加入制品
+                        added += 1  # 计数
+                if added > 0:  # 有日志才上传
+                    _WANDB_RUN.log_artifact(artifact)  # 上传
+                    logger.info('Uploaded {} log file(s) to W&B artifact: {}'.format(added, log_dir))  # 记录上传结果
+    except Exception as exc:  # 上传失败不应影响训练结果
+        logger.warning('W&B artifact upload failed: {}'.format(exc))  # 只告警
+    finally:
+        try:
+            _WANDB_RUN.finish()  # 关闭 run，确保数据落盘
+        except Exception:  # 关闭失败也无需抛出
+            pass  # 静默忽略
+        _WANDB_RUN = None  # 清理全局引用
+
+
 def parse_args():  # 定义命令行参数解析函数（eval.py 也会 import 复用本函数）
     parser = argparse.ArgumentParser(description='Semantic Segmentation Training With Pytorch')  # 创建解析器并写明脚本用途
     # model and dataset
@@ -150,7 +287,9 @@ def parse_args():  # 定义命令行参数解析函数（eval.py 也会 import �
     parser.add_argument('--aux-weight', type=float, default=0.4,  # 辅助损失加权系数，默认 0.4
                         help='auxiliary loss weight')  # 帮助文本：辅助损失权重
     parser.add_argument('--batch-size', type=int, default=4, metavar='N',  # 训练批大小（每 GPU 样本数），默认 4
-                        help='input batch size for training (default: 8)')  # 【注意】help 写的默认值 8 与实际 default=4 不一致
+                        help='input batch size for training (per GPU, default: 4)')  # 每个进程/每张 GPU 的批大小
+    parser.add_argument('--val-batch-size', type=int, default=0, metavar='N',  # 验证批大小（每 GPU）；0 表示与 --batch-size 相同
+                        help='input batch size for validation (per GPU, 0 = same as --batch-size)')  # 验证阶段通常无梯度，可显著调大以提升 GPU 利用率
     parser.add_argument('--start_epoch', type=int, default=0,  # 起始 epoch 编号，默认 0
                         metavar='N', help='start epochs (default:0)')  # 【注意】该参数定义后从未被使用（训练按 iteration 计数，断点续训也未用到）
     parser.add_argument('--epochs', type=int, default=50, metavar='N',  # 总训练轮数（epoch），默认 50
@@ -172,6 +311,26 @@ def parse_args():  # 定义命令行参数解析函数（eval.py 也会 import �
     parser.add_argument('--best-metric', type=str, default='miou',  # 用哪个验证指标挑选并保存 best_model
                         choices=['miou', 'pixacc', 'mpa', 'fwiou', 'mean'],  # miou=平均 IoU（推荐）、pixacc=像素准确率、mpa=平均像素准确率、fwiou=频率加权 IoU、mean=旧版 (pixAcc+mIoU)/2
                         help='metric used to select the best checkpoint (default: miou)')  # 帮助文本：模型选优标准
+    # Weights & Biases tracking (optional; mainly used on Kaggle)
+    parser.add_argument('--wandb', action='store_true', default=False,  # 开启 W&B 实验跟踪
+                        help='enable Weights & Biases logging (rank 0 only)')  # 仅 0 号进程初始化/记录
+    parser.add_argument('--wandb-project', type=str, default='ReplicateTest',  # W&B 项目名
+                        help='W&B project name (default: ReplicateTest)')  # 所有实验默认汇聚到同一个项目
+    parser.add_argument('--wandb-entity', type=str, default=None,  # W&B 团队/用户名，默认使用当前登录账号
+                        help='W&B entity (team or username)')  # 一般留空即可
+    parser.add_argument('--wandb-run-name', type=str, default=None,  # 运行名；留空则按参数自动生成
+                        help='W&B run name (default: auto from model/backbone/dataset/GPU/LR/batch/epochs/AMP/time)')  # 便于区分不同配置的运行
+    parser.add_argument('--wandb-group', type=str, default=None,  # 运行分组；留空则为 model_backbone_dataset
+                        help='W&B group (default: {model}_{backbone}_{dataset})')  # 同一配置的多次运行归为一组
+    parser.add_argument('--wandb-tags', type=str, default=None,  # 额外标签，逗号分隔
+                        help='extra W&B tags, comma separated')  # 默认标签已包含 model/backbone/dataset/ddpN/amp
+    parser.add_argument('--wandb-mode', type=str, default=None,  # online / offline / disabled
+                        choices=['online', 'offline', 'disabled'],  # 仅接受这三种模式
+                        help='W&B mode: online, offline or disabled')  # Kaggle 网络不稳时可用 offline，之后 wandb sync
+    parser.add_argument('--no-wandb-save-model', action='store_true', default=False,  # 不上传 best_model 制品
+                        help='do not upload the best checkpoint as a W&B artifact')  # VGG16 模型较大时可关闭
+    parser.add_argument('--no-wandb-save-logs', action='store_true', default=False,  # 不上传日志文件制品
+                        help='do not upload log files as a W&B artifact')  # 默认把 runs/log 下的 txt 日志打包上传
     # cuda setting
     parser.add_argument('--no-cuda', action='store_true', default=False,  # 禁用 CUDA 的开关，默认 False（默认尽量用 GPU）
                         help='disables CUDA training')  # 帮助文本：禁用 CUDA 训练
@@ -226,6 +385,8 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
         self.args = args  # 保存命令行参数（后续会向其中补充 iters_per_epoch 等派生量）
         self.device = torch.device(args.device)  # 根据参数选定计算设备（"cuda" 或 "cpu"）
         self.amp = bool(getattr(args, 'amp', False) and self.device.type == 'cuda')  # 仅在 CUDA 上启用 AMP（CPU 上无收益且部分算子不支持）
+        if getattr(args, 'val_batch_size', 0) <= 0:  # 验证批大小未显式指定时沿用训练批大小
+            args.val_batch_size = args.batch_size  # 每卡验证批大小
 
         # image transform
         input_transform = transforms.Compose([  # 组合输入图像预处理流水线
@@ -247,16 +408,18 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
         train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)  # 训练采样器：打乱样本顺序，分布式时按 rank 划分数据
         train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, args.max_iters)  # 训练批采样器：组 batch 并保证总迭代数恰为 max_iters
         val_sampler = make_data_sampler(val_dataset, False, args.distributed)  # 验证采样器：顺序取样不打乱，分布式时按 rank 划分
-        val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=False)  # 验证集保留最后一个不完整 batch，避免漏评样本
+        val_batch_sampler = make_batch_data_sampler(val_sampler, args.val_batch_size, drop_last=False)  # 验证集保留最后一个不完整 batch，避免漏评样本
 
         self.train_loader = data.DataLoader(dataset=train_dataset,  # 训练数据加载器：绑定训练数据集
                                             batch_sampler=train_batch_sampler,  # 用批采样器控制取样顺序与组批
                                             num_workers=args.workers,  # 多进程并行加载与预处理数据
-                                            pin_memory=True)  # 锁页内存，加速 CPU→GPU 数据搬运
+                                            pin_memory=True,  # 锁页内存，加速 CPU→GPU 数据搬运
+                                            persistent_workers=args.workers > 0)  # 保持 worker 存活，避免每轮/每次验证重建进程
         self.val_loader = data.DataLoader(dataset=val_dataset,  # 验证数据加载器：绑定验证数据集
                                           batch_sampler=val_batch_sampler,  # 用验证批采样器顺序取样
                                           num_workers=args.workers,  # 多进程并行加载
-                                          pin_memory=True)  # 锁页内存加速传输
+                                          pin_memory=True,  # 锁页内存加速传输
+                                          persistent_workers=args.workers > 0)  # 保持 worker 存活，减少验证启动开销
 
         # create network
         BatchNorm2d = nn.SyncBatchNorm if args.distributed else nn.BatchNorm2d  # 分布式用跨卡同步 BN（统计量全局一致），单机用普通 BN
@@ -303,7 +466,8 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
                                                              output_device=args.local_rank)  # 指定输出设备为本进程的 GPU
 
         # evaluation metrics
-        self.metric = SegmentationMetric(train_dataset.num_class)  # 创建分割指标：类别数取自训练集的 num_class 属性
+        self.metric = SegmentationMetric(train_dataset.num_class, device=self.device)  # 创建分割指标：混淆矩阵直接在 GPU 上累计，避免逐 batch 同步
+        self.last_val_scores = None  # 最近一次验证的完整指标（供 W&B/外部读取）
 
         self.best_pred = 0.0  # 历史最优验证得分（默认按 mIoU 选优，可由 --best-metric 切换），初始为 0
 
@@ -341,6 +505,10 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
                         logger.info('Epoch {:d}/{:d} done | train loss {:.4f} | lr {:.2e}'.format(  # 上一轮平均损失与学习率
                             current_epoch, epochs, epoch_loss / max(1, epoch_iters),
                             self.optimizer.param_groups[0]['lr']))
+                        wandb_log({'train/epoch': current_epoch,  # W&B：轮次
+                                   'train/loss': epoch_loss / max(1, epoch_iters),  # W&B：本轮平均训练损失
+                                   'train/lr': self.optimizer.param_groups[0]['lr']},  # W&B：当前学习率
+                                  step=iteration - 1)  # 用全局迭代号作为横轴
                     epoch_loss, epoch_iters = 0.0, 0  # 重置新一轮统计
                 current_epoch = epoch  # 记录当前 epoch
 
@@ -380,13 +548,17 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
                     save_checkpoint(self.model, self.args, is_best=False)  # 常规保存（不标记为最优）
 
                 if not self.args.skip_val and iteration % val_per_iters == 0:  # 未跳过验证且到达验证间隔时执行验证
-                    self.validation(epoch)  # 在验证集上评估全部指标，若选优指标创新高则保存 best_model
+                    self.validation(epoch, iteration)  # 在验证集上评估全部指标，若选优指标创新高则保存 best_model
                     self.model.train()  # 验证用的 eval 模式会改变 BN/Dropout 行为，验证后须切回训练模式
 
             if epoch_iters > 0 and save_to_disk:  # 最后一个 epoch 的汇总（循环内只在跨轮时打印上一轮）
                 logger.info('Epoch {:d}/{:d} done | train loss {:.4f} | lr {:.2e}'.format(
                     current_epoch, epochs, epoch_loss / max(1, epoch_iters),
                     self.optimizer.param_groups[0]['lr']))
+                wandb_log({'train/epoch': current_epoch,  # W&B：最后一个 epoch 的汇总
+                           'train/loss': epoch_loss / max(1, epoch_iters),  # 平均损失
+                           'train/lr': self.optimizer.param_groups[0]['lr']},  # 学习率
+                          step=max_iters)  # 横轴为总迭代数
             progress.close()  # 关闭训练总进度条
 
         if save_to_disk:  # 仅主进程写最终权重
@@ -397,16 +569,16 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
             "Total training time: {} ({:.4f}s / it)".format(  # 训练总耗时与平均单次迭代耗时的格式串
                 total_training_str, total_training_time / max(1, max_iters)))  # 平均耗时 = 总耗时 / 总迭代数
 
-    def validation(self, epoch=None):  # 验证函数：在验证集上累积计算 pixAcc/mIoU/mPA/FWIoU 等指标
+    def validation(self, epoch=None, step=None):  # 验证函数：在验证集上累积计算 pixAcc/mIoU/mPA/FWIoU 等指标
         save_to_disk = get_rank() == 0  # 仅主进程打印日志/保存模型
         is_best = False  # 是否为最优模型的标记，默认 False
-        self.metric.reset()  # 清空指标内部累积的统计量
+        self.metric.reset()  # 清空指标内部累积的混淆矩阵
         if self.args.distributed:  # 分布式时模型被 DDP 包装
             model = self.model.module  # 取出 DDP 内部的原始模型用于前向（省去 DDP 包装层的开销）
         else:  # 单机（非分布式）分支：直接使用原始模型
             model = self.model  # 单机直接使用模型本身
-        if torch.cuda.is_available():  # 有 CUDA 时清空缓存显存，为验证阶段腾出空间
-            torch.cuda.empty_cache()  # 释放未使用的缓存显存
+        # 注意：这里不再调用 torch.cuda.empty_cache()。它会让每轮验证后显存重新分配，
+        # 与 caching allocator 冲突并造成明显停顿，是"验证阶段 GPU 利用率低"的原因之一。
         model.eval()  # 切换评估模式：BN 使用运行统计量，Dropout 关闭
 
         desc = 'Val' if epoch is None else 'Val {}/{}'.format(epoch, self.args.epochs)  # 进度条描述：带轮次信息
@@ -421,7 +593,11 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
         else:  # 非主进程或未安装 tqdm
             val_bar = None  # 不使用进度条
 
-        log_every = max(1, len(self.val_loader) // 10)  # 无 tqdm 时按 10% 间隔打印日志
+        # 只在约 10% 的位置刷新一次指标：metric.get() 会读取 GPU 统计量并触发同步，
+        # 每个 batch 都调用会让 GPU 频繁等待 CPU，掩盖双卡并行效果。
+        refresh_every = max(1, len(self.val_loader) // 10)
+        num_batches = len(self.val_loader)
+        pixAcc, mIoU = 0.0, 0.0  # 中间展示用，最终数值在验证结束后统一计算
         for i, (image, target, filename) in enumerate(self.val_loader):  # 逐批遍历验证集（filename 为文件名列表，此处未使用）
             image = image.to(self.device, non_blocking=True)  # 图像搬运到计算设备
             target = target.to(self.device, non_blocking=True)  # 标签搬运到计算设备
@@ -429,23 +605,26 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
             with torch.no_grad():  # 关闭梯度追踪，节省显存并加速推理
                 with autocast_context(self.device.type, self.amp):  # AMP 推理上下文
                     outputs = model(image)  # 前向推理得到输出列表
-            self.metric.update(outputs[0], target)  # 用主输出（outputs[0]）与标签更新累计统计量
-            pixAcc, mIoU = self.metric.get()  # 获取到目前为止累积的像素精度与平均 IoU
-            if val_bar is not None:  # 主进程：把累计指标动态显示在验证进度条右侧
-                val_bar.set_postfix(pixAcc='{:.3f}'.format(pixAcc),  # 当前累计像素精度
-                                    mIoU='{:.3f}'.format(mIoU),  # 当前累计平均 IoU
-                                    refresh=False)  # 交由 update 统一刷新，避免重复渲染
-                val_bar.update(1)  # 进度 +1 并刷新当前 batch 的指标
-            elif save_to_disk and ((i + 1) % log_every == 0 or (i + 1) == len(self.val_loader)):  # 无 tqdm 时的兜底日志
+            self.metric.update(outputs[0], target)  # 在 GPU 上累计混淆矩阵（不触发同步）
+
+            if val_bar is not None:  # 主进程：推进进度条
+                val_bar.update(1)  # 每个 batch 前进一格（不读取指标，避免同步）
+                if (i + 1) % refresh_every == 0 or (i + 1) == num_batches:  # 间隔刷新指标
+                    pixAcc, mIoU = self.metric.get()  # 仅在刷新点读取一次累计指标
+                    val_bar.set_postfix(pixAcc='{:.3f}'.format(pixAcc),  # 当前累计像素精度
+                                        mIoU='{:.3f}'.format(mIoU))  # 当前累计平均 IoU（触发一次刷新）
+            elif save_to_disk and ((i + 1) % refresh_every == 0 or (i + 1) == num_batches):  # 无 tqdm 时的兜底日志
+                pixAcc, mIoU = self.metric.get()  # 仅在刷新点读取一次累计指标
                 logger.info("Validation batch: {:d}/{:d}, pixAcc: {:.3f}, mIoU: {:.3f}".format(  # 验证中间日志
-                    i + 1, len(self.val_loader), pixAcc, mIoU))  # 当前累计指标（0~1 小数，非百分比）
+                    i + 1, num_batches, pixAcc, mIoU))  # 当前累计指标（0~1 小数，非百分比）
 
         if val_bar is not None:  # 关闭验证进度条
             val_bar.close()  # 释放进度条显示
 
-        self.metric.all_reduce()  # 多卡验证：把各 rank 的统计量求和，得到全局指标
+        self.metric.all_reduce()  # 多卡验证：把各 rank 的混淆矩阵求和，得到全局指标
         scores = self.metric.get_scores()  # 一次性取出全部指标
-        pixAcc, mIoU = self.metric.get()  # (pixAcc, mIoU) 保持与旧接口一致
+        pixAcc, mIoU = scores['pixel_accuracy'], scores['mean_iou']  # 与旧接口兼容的 (pixAcc, mIoU)
+        self.last_val_scores = scores  # 缓存最近一次验证结果
         if save_to_disk:  # 仅主进程打印最终指标
             logger.info(  # 最终验证指标：保留原有 pixAcc/mIoU 格式，并追加 mPA/FWIoU/mF1
                 "Validation pixAcc: {:.3f}, mIoU: {:.3f}, mPA: {:.3f}, FWIoU: {:.3f}, mF1: {:.3f}".format(
@@ -473,6 +652,15 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
                 logger.info("Best model updated: {} = {:.4f}".format(metric_name, new_pred))  # 打印新的最优指标
         if save_to_disk:  # 仅主进程保存 checkpoint，避免多卡重复写同一文件
             save_checkpoint(self.model, self.args, is_best)  # 保存 checkpoint（is_best=True 时额外复制出 best_model 文件）
+            wandb_log({  # W&B：记录本轮验证指标
+                'val/pixel_accuracy': pixAcc,  # 像素准确率
+                'val/mIoU': mIoU,  # 平均 IoU
+                'val/mPA': scores['mean_pixel_accuracy'],  # 平均像素准确率
+                'val/FWIoU': scores['frequency_weighted_iou'],  # 频率加权 IoU
+                'val/mF1': scores['mean_f1'],  # 平均 F1
+                'val/best': self.best_pred,  # 历史最优值
+                'val/epoch': epoch if epoch is not None else -1,  # 轮次
+            }, step=step)  # 以全局迭代号为横轴，与 train/* 对齐
         synchronize()  # 分布式屏障：等待所有进程完成本轮流验证后再继续训练
 
 
@@ -517,6 +705,8 @@ if __name__ == '__main__':  # 脚本直接执行时的入口（被 import 时不
         num_gpus = 1  # 修正 GPU 数，避免 WORLD_SIZE 残留导致学习率被错误放大
         args.num_gpus = 1  # 同步回参数对象，供 iters_per_epoch 计算使用
     args.amp = bool(args.amp and args.device == "cuda")  # AMP 只在 CUDA 上启用；CPU 训练自动关闭
+    if args.val_batch_size <= 0:  # 验证批大小 0 表示沿用训练批大小
+        args.val_batch_size = args.batch_size  # 提前归一化，便于写进 W&B config
     if args.distributed:  # 初始化分布式训练环境
         if args.local_rank >= torch.cuda.device_count():  # 本地 rank 超出可见 GPU 数量
             raise RuntimeError(  # 提前给出明确错误，避免 NCCL 初始化时出现难懂的报错
@@ -525,16 +715,22 @@ if __name__ == '__main__':  # 脚本直接执行时的入口（被 import 时不
         torch.cuda.set_device(args.local_rank)  # 绑定当前进程使用的 GPU
         torch.distributed.init_process_group(backend="nccl", init_method="env://")  # 以 NCCL 后端、环境变量寻址方式初始化进程组
         synchronize()  # 等待全部进程完成初始化
+    args.base_lr = args.lr  # 保存用户传入的原始学习率（用于 W&B run 名与 config，避免被线性放大后的值干扰）
     args.lr = args.lr * num_gpus  # 学习率按 GPU 数线性放大（linear scaling rule）：多卡实际学习率 = 单卡 lr × N
 
     logger = setup_logger("semantic_segmentation", args.log_dir, get_rank(), filename='{}_{}_{}_log.txt'.format(  # 初始化全局日志器：输出到 log_dir，文件名含模型/骨干/数据集；train()/validation() 中引用的 logger 即此全局变量
         args.model, args.backbone, args.dataset))  # 日志文件名格式：模型_骨干_数据集_log.txt
     logger.info("Using {} GPUs (world_size={}, local_rank={})".format(  # 记录使用的 GPU 数量与本地 rank
         num_gpus, num_gpus, args.local_rank))  # world_size 与 num_gpus 同值，便于排查多卡问题
-    logger.info("AMP: {} | best checkpoint metric: {}".format(args.amp, args.best_metric))  # 记录 AMP 与选优标准
+    logger.info("AMP: {} | best checkpoint metric: {} | val batch size/GPU: {}".format(  # 记录关键训练配置
+        args.amp, args.best_metric, args.val_batch_size))  # AMP、选优标准、验证批大小
     logger.info(args)  # 记录完整参数配置，便于复现实验
 
-    trainer = Trainer(args)  # 创建训练器实例（完成数据/模型/优化器等全部初始化）
-    trainer.train()  # 启动训练主循环
+    init_wandb(args, logger)  # 初始化 W&B（仅 rank 0；失败只告警，不影响训练）
+    try:
+        trainer = Trainer(args)  # 创建训练器实例（完成数据/模型/优化器等全部初始化）
+        trainer.train()  # 启动训练主循环
+    finally:
+        finish_wandb(args, logger)  # 上传 best_model / 日志 Artifact 并结束 run（异常退出也会执行）
     if torch.cuda.is_available():  # 有 CUDA 时训练结束清空缓存显存
         torch.cuda.empty_cache()  # 训练结束后清空 CUDA 缓存显存

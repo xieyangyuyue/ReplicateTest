@@ -64,12 +64,19 @@ class Evaluator(object):  # 评估器类：封装验证数据加载、模型构�
                                             aux=args.aux, pretrained=True, pretrained_base=False,  # pretrained=True 加载训练好的分割头权重；pretrained_base=False 不再下载 backbone 的 ImageNet 预训练权重
                                             local_rank=args.local_rank,  # 【注意】评估并不需要 local_rank，仅为兼容部分模型构造函数的传参而保留
                                             norm_layer=BatchNorm2d).to(self.device)  # 指定 BN 层类型，并将模型搬到计算设备
+        if getattr(args, 'resume', None):  # 指定 --resume 时加载自己训练好的权重（优先于模型库默认权重）
+            resume_path = os.path.expanduser(args.resume)  # 支持 ~ 展开
+            if not os.path.isfile(resume_path):  # 校验文件存在
+                raise FileNotFoundError('checkpoint not found: {}'.format(resume_path))  # 明确报错
+            state_dict = torch.load(resume_path, map_location='cpu')  # 先加载到 CPU，避免多卡各自占用显存
+            self.model.load_state_dict(state_dict)  # 覆盖模型库默认权重
+            logger.info('Loaded checkpoint for evaluation: {}'.format(resume_path))  # 记录实际使用的权重
         if args.distributed:  # 分布式评估时包装模型
             self.model = nn.parallel.DistributedDataParallel(self.model,  # 包装为 DDP：推理虽不需要梯度同步，但配合分布式采样器切分数据
                 device_ids=[args.local_rank], output_device=args.local_rank)  # 指定当前进程的输入/输出 GPU
         self.model.to(self.device)  # 【注意】DDP 包装后又执行一次 .to(device)，属冗余写法（无害）
 
-        self.metric = SegmentationMetric(val_dataset.num_class)  # 按验证集类别数创建分割评价指标
+        self.metric = SegmentationMetric(val_dataset.num_class, device=self.device)  # 按验证集类别数创建指标；混淆矩阵在 GPU 上累计
 
     def eval(self):  # 评估主流程：遍历验证集，累积指标并保存预测图
         self.metric.reset()  # 重置混淆矩阵等累积状态
@@ -79,6 +86,7 @@ class Evaluator(object):  # 评估器类：封装验证数据加载、模型构�
         else:  # 单机（非分布式）分支：直接使用原始模型
             model = self.model  # 单机直接使用模型本身
         logger.info("Start validation, Total sample: {:d}".format(len(self.val_loader)))  # 打印验证集批次数（batch=1 时即样本数）
+        log_every = max(1, len(self.val_loader) // 10)  # 每约 10% 打印一次累计指标，避免逐样本同步拖慢评估
         for i, (image, target, filename) in enumerate(self.val_loader):  # 逐样本遍历验证集（filename 为文件名列表，供保存预测图用）
             image = image.to(self.device)  # 图像搬运到计算设备
             target = target.to(self.device)  # 标签搬运到计算设备
@@ -86,9 +94,10 @@ class Evaluator(object):  # 评估器类：封装验证数据加载、模型构�
             with torch.no_grad():  # 关闭梯度追踪，节省显存并加速推理
                 outputs = model(image)  # 前向推理得到输出列表
             self.metric.update(outputs[0], target)  # 用主输出（outputs[0]）与标签更新混淆矩阵
-            pixAcc, mIoU = self.metric.get()  # 获取到目前为止累积的像素精度与平均 IoU
-            logger.info("Sample: {:d}, validation pixAcc: {:.3f}, mIoU: {:.3f}".format(  # 逐样本打印当前累计指标
-                i + 1, pixAcc * 100, mIoU * 100))  # 【注意】此处乘 100 转为百分比显示，而 train.py 的 validation() 未乘，两处口径不一致
+            if (i + 1) % log_every == 0 or (i + 1) == len(self.val_loader):  # 只在间隔点读取指标（get() 会触发 GPU 同步）
+                pixAcc, mIoU = self.metric.get()  # 获取到目前为止累积的像素精度与平均 IoU
+                logger.info("Sample: {:d}, validation pixAcc: {:.3f}, mIoU: {:.3f}".format(  # 打印当前累计指标
+                    i + 1, pixAcc * 100, mIoU * 100))  # 【注意】此处乘 100 转为百分比显示，而 train.py 的 validation() 未乘，两处口径不一致
 
             if self.args.save_pred:  # 若开启预测图保存（当前在 __main__ 中被强制开启）
                 pred = torch.argmax(outputs[0], 1)  # 沿通道维取最大值索引，得到每像素的类别预测
