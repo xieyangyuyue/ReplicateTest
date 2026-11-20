@@ -13,6 +13,11 @@ from __future__ import print_function  # Python 2 兼容导入：Python 3 中 pr
 import os  # 操作系统接口：路径展开/拼接、目录创建、文件删除
 import zipfile  # zip 压缩包处理：解压下载下来的权重压缩包
 
+try:  # 多进程文件锁：torchrun 的多个 rank 可能同时下载同一份骨干权重
+    import fcntl  # Linux/Unix 提供 flock
+except ImportError:  # Windows 等没有 fcntl
+    fcntl = None  # 退化为无锁（Kaggle/Linux 环境不会走到这里）
+
 from ..utils.download import download, check_sha1  # 自研下载工具：download 下载文件到本地、check_sha1 校验文件哈希
 
 __all__ = ['get_model_file', 'get_resnet_file']  # 模块公开接口：两个权重文件定位函数
@@ -80,18 +85,39 @@ def get_resnet_file(name, root='~/.torch/models'):  # 获取 ResNet 骨干权重
         print('Model file {} is not found. Downloading.'.format(file_path))  # 提示未找到缓存，开始下载
 
     if not os.path.exists(root):  # 缓存目录不存在
-        os.makedirs(root)  # 递归创建缓存目录
+        os.makedirs(root, exist_ok=True)  # 递归创建缓存目录
 
-    zip_file_path = os.path.join(root, file_name + '.zip')  # 临时 zip 压缩包的完整保存路径
-    repo_url = os.environ.get('ENCODING_REPO', encoding_repo_url)  # 优先读取环境变量 ENCODING_REPO 覆盖默认仓库地址
-    if repo_url[-1] != '/':  # 仓库地址末尾缺少斜杠
-        repo_url = repo_url + '/'  # 补齐斜杠，保证 URL 模板拼接正确
-    download(_url_format.format(repo_url=repo_url, file_name=file_name),  # 按 URL 模板拼出下载地址并下载权重 zip 包
-             path=zip_file_path,  # 下载内容保存到本地 zip 路径
-             overwrite=True)  # 覆盖已存在的同名 zip 文件
-    with zipfile.ZipFile(zip_file_path) as zf:  # 打开下载好的 zip 压缩包（with 确保用完关闭）
-        zf.extractall(root)  # 解压全部内容到缓存目录，得到 .pth 权重文件
-    os.remove(zip_file_path)  # 删除临时 zip 包，节省磁盘空间
+    # 【多卡关键修复】torchrun 会同时启动多个 rank，它们会同时构建模型并调用本函数。
+    # 原实现让所有 rank 同时下载/解压/删除同一个 zip，导致：
+    #   FileNotFoundError: .../resnet101s-03a0f310.zip
+    # 或解压出损坏的 .pth。这里用文件锁把“下载 + 解压”串行化，并在加锁后重新检查缓存。
+    lock_file_path = os.path.join(root, '.{}.lock'.format(file_name))  # 锁文件与权重同目录
+    lock_file = open(lock_file_path, 'w')  # 打开锁文件（内容无关）
+    try:
+        if fcntl is not None:  # Linux/Unix：排他锁
+            fcntl.flock(lock_file, fcntl.LOCK_EX)  # 同一时刻只允许一个进程下载/解压
+
+        # 加锁后重新检查：可能另一个 rank 已经下载完成并释放了锁
+        if os.path.exists(file_path) and check_sha1(file_path, sha1_hash):  # 缓存已就绪且校验通过
+            return file_path  # 直接复用，避免重复下载
+
+        zip_file_path = os.path.join(root, '{}.{}.zip'.format(file_name, os.getpid()))  # 每个进程独立临时 zip，避免互相覆盖
+        repo_url = os.environ.get('ENCODING_REPO', encoding_repo_url)  # 优先读取环境变量 ENCODING_REPO 覆盖默认仓库地址
+        if repo_url[-1] != '/':  # 仓库地址末尾缺少斜杠
+            repo_url = repo_url + '/'  # 补齐斜杠，保证 URL 模板拼接正确
+        try:
+            download(_url_format.format(repo_url=repo_url, file_name=file_name),  # 按 URL 模板拼出下载地址并下载权重 zip 包
+                     path=zip_file_path,  # 下载内容保存到进程独立的临时 zip
+                     overwrite=True)  # 覆盖已存在的同名 zip 文件
+            with zipfile.ZipFile(zip_file_path) as zf:  # 打开下载好的 zip 压缩包（with 确保用完关闭）
+                zf.extractall(root)  # 解压全部内容到缓存目录，得到 .pth 权重文件
+        finally:
+            if os.path.exists(zip_file_path):  # 无论下载/解压成功与否都清理临时 zip
+                os.remove(zip_file_path)  # 删除临时 zip 包，节省磁盘空间
+    finally:
+        if fcntl is not None:  # 释放排他锁，让等待中的 rank 继续
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()  # 关闭锁文件句柄
 
     if check_sha1(file_path, sha1_hash):  # 对解压出的 .pth 再做一次 SHA1 校验
         return file_path  # 校验通过，返回权重路径
