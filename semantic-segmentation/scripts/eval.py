@@ -136,7 +136,12 @@ if __name__ == '__main__':  # 脚本直接执行时的入口（被 import 时不
                 'local_rank={} >= visible GPU count={}. Check CUDA_VISIBLE_DEVICES and --nproc_per_node.'.format(
                     args.local_rank, torch.cuda.device_count()))
         torch.cuda.set_device(args.local_rank)  # 绑定当前进程使用的 GPU
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")  # 以 NCCL 后端、环境变量寻址方式初始化进程组
+        try:  # 新版 PyTorch 支持显式指定通信设备，避免 NCCL 猜测设备
+            torch.distributed.init_process_group(
+                backend="nccl", init_method="env://",
+                device_id=torch.device("cuda", args.local_rank))  # 显式绑定本进程 GPU
+        except TypeError:  # 旧版 PyTorch 无 device_id 参数
+            torch.distributed.init_process_group(backend="nccl", init_method="env://")  # 回退
         synchronize()  # 等待全部进程完成初始化
 
     # TODO: optim code

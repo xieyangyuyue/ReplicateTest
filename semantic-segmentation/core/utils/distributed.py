@@ -85,7 +85,13 @@ def synchronize():
     world_size = dist.get_world_size()  # 读取进程总数
     if world_size == 1:  # 只有单个进程
         return  # barrier 无意义，跳过
-    dist.barrier()  # 屏障：所有进程都到达此处才一起继续，用于对齐各进程执行进度（如评估/保存前同步）
+    if dist.get_backend() == 'nccl' and torch.cuda.is_available():  # NCCL 下显式指定设备，避免 barrier 警告
+        try:  # 新版 PyTorch 支持 device_ids
+            dist.barrier(device_ids=[torch.cuda.current_device()])  # 屏障：所有进程都到达此处才一起继续
+        except TypeError:  # 旧版没有 device_ids 参数
+            dist.barrier()  # 回退
+    else:  # gloo 等 CPU 后端
+        dist.barrier()  # 无需 device_ids
 
 
 # 跨进程收集任意可 pickle 对象：每个进程各提交一份 data，返回按 rank 排序的对象列表

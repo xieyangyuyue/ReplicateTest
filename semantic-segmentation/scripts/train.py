@@ -462,8 +462,13 @@ class Trainer(object):  # 训练器类：封装数据/模型/优化器构建以�
                                          warmup_method=args.warmup_method)  # warmup 方式：linear 或 constant
 
         if args.distributed:  # 分布式训练时包装模型
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[args.local_rank],  # 包装为 DDP：反向传播时自动跨卡 all-reduce 梯度
-                                                             output_device=args.local_rank)  # 指定输出设备为本进程的 GPU
+            # find_unused_parameters=True：ResNet 骨干里保留了 ImageNet 分类头 self.fc，
+            # 分割前向不会用到它，默认 DDP 会因“上一轮梯度未全部就绪”直接报错。
+            # 打开该选项后 DDP 会忽略未参与 loss 的参数（本仓库另外的 aux/JPU 分支也受益）。
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model, device_ids=[args.local_rank],  # 包装为 DDP：反向传播时自动跨卡 all-reduce 梯度
+                output_device=args.local_rank,  # 指定输出设备为本进程的 GPU
+                find_unused_parameters=True)  # 允许存在未使用参数（如 backbone.fc）
 
         # evaluation metrics
         self.metric = SegmentationMetric(train_dataset.num_class, device=self.device)  # 创建分割指标：混淆矩阵直接在 GPU 上累计，避免逐 batch 同步
@@ -713,7 +718,11 @@ if __name__ == '__main__':  # 脚本直接执行时的入口（被 import 时不
                 'local_rank={} >= visible GPU count={}. Check CUDA_VISIBLE_DEVICES and --nproc_per_node.'.format(
                     args.local_rank, torch.cuda.device_count()))
         torch.cuda.set_device(args.local_rank)  # 绑定当前进程使用的 GPU
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")  # 以 NCCL 后端、环境变量寻址方式初始化进程组
+        try:  # 新版 PyTorch 支持显式指定通信设备，避免 NCCL 按 global rank 猜测设备
+            torch.distributed.init_process_group(backend="nccl", init_method="env://",  # 以 NCCL 后端、环境变量寻址方式初始化进程组
+                                                 device_id=torch.device("cuda", args.local_rank))  # 显式绑定本进程 GPU
+        except TypeError:  # 旧版 PyTorch 没有 device_id 参数
+            torch.distributed.init_process_group(backend="nccl", init_method="env://")  # 回退到原写法
         synchronize()  # 等待全部进程完成初始化
     args.base_lr = args.lr  # 保存用户传入的原始学习率（用于 W&B run 名与 config，避免被线性放大后的值干扰）
     args.lr = args.lr * num_gpus  # 学习率按 GPU 数线性放大（linear scaling rule）：多卡实际学习率 = 单卡 lr × N

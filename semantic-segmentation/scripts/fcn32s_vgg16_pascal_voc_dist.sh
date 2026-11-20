@@ -19,6 +19,6 @@ NGPUS="${NGPUS:-2}"  # 默认使用 2 张 GPU，可执行 NGPUS=2 bash xxx.sh �
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}" \
 torchrun --nproc_per_node="${NGPUS}" --master_port=29500 train.py \
     --model fcn32s --backbone vgg16 --dataset pascal_voc \
-    --lr 0.0001 --epochs 100 \
-    --batch-size 40 --val-batch-size 8 --workers 2 --amp \
+    --lr 1e-3 --epochs 80 \
+    --batch-size 50 --val-batch-size 8 --workers 2 --amp \
     --best-metric miou
